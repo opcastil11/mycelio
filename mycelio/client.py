@@ -26,6 +26,7 @@ from anyio.streams.tls import TLSStream
 
 from mycelio.crypto import SignatureError, verify_chain
 from mycelio.frame import HEADER_LEN, Frame, FrameError, decode_frame, encode_frame
+from mycelio.manifest import Manifest, ParamLocation, decode_manifest
 from mycelio.payload import PayloadError, TypeCode, decode_payload, encode_payload
 from mycelio.verbs import Verb
 
@@ -47,6 +48,25 @@ class DiscoverEntry:
 class DiscoverResponse:
     results: list[DiscoverEntry] = field(default_factory=list)
     total: int = 0
+
+
+@dataclass
+class RouteResponse:
+    """A response from a ROUTE call. Body is raw backend bytes (typically JSON)."""
+
+    status_code: int
+    content_type: str
+    body: bytes
+
+    def json(self) -> Any:
+        """Parse the body as JSON. Raises if content-type isn't JSON."""
+        import json as _json
+        if "json" not in self.content_type.lower() and self.content_type:
+            raise ValueError(f"backend returned {self.content_type}, not JSON")
+        return _json.loads(self.body.decode("utf-8"))
+
+    def text(self) -> str:
+        return self.body.decode("utf-8", errors="replace")
 
 
 class MycelioClient:
@@ -139,6 +159,77 @@ class MycelioClient:
 
         response = await self._request(Verb.DISCOVER, encode_payload(req_fields))
         return self._parse_discover(response.payload)
+
+    async def inspect(self, service_id: bytes) -> Manifest:
+        """Fetch the full manifest for a service. Verifies the directory's
+        countersignature locally (the manifest itself carries its own sigs)."""
+        if len(service_id) != 8:
+            raise ValueError(f"service_id must be 8 bytes, got {len(service_id)}")
+        payload = encode_payload({1: (TypeCode.HASH, service_id)})
+        response = await self._request(Verb.INSPECT, payload)
+        fields = decode_payload(response.payload) if response.payload else {}
+        if 1 not in fields:
+            raise ClientError("INSPECT response missing manifest bytes (field 1)")
+        manifest_bytes = fields[1][1]
+        return decode_manifest(manifest_bytes)
+
+    async def route(
+        self,
+        manifest: Manifest,
+        op: str,
+        params: dict[str, Any] | None = None,
+        *,
+        payment_proof: bytes | None = None,
+    ) -> RouteResponse:
+        """Invoke an op on a service. `manifest` must be a freshly INSPECTed
+        Manifest — its param order defines the on-wire field IDs.
+
+        Example:
+            m = await cli.inspect(svc_hash)
+            r = await cli.route(m, "charge", {"amount": 500, "currency": "usd"})
+            print(r.status_code, r.json())
+        """
+        params = params or {}
+        op_def = manifest.get_op(op)
+
+        # Encode params in manifest order — field id N = nth param in op.params.
+        param_fields: dict[int, tuple[TypeCode, Any]] = {}
+        for idx, p in enumerate(op_def.params, start=1):
+            if p.key not in params:
+                if p.required:
+                    raise ValueError(f"missing required param: {p.key!r}")
+                continue
+            value = params[p.key]
+            # Pick a wire type for the value.
+            if isinstance(value, bool):
+                param_fields[idx] = (TypeCode.BOOL, value)
+            elif isinstance(value, int):
+                param_fields[idx] = (TypeCode.U64, value)
+            elif isinstance(value, str):
+                param_fields[idx] = (TypeCode.STRING, value)
+            elif isinstance(value, (bytes, bytearray)):
+                param_fields[idx] = (TypeCode.BYTES, bytes(value))
+            else:
+                raise ValueError(
+                    f"unsupported param type for {p.key!r}: {type(value).__name__}"
+                )
+
+        req_fields: dict[int, tuple[TypeCode, Any]] = {
+            1: (TypeCode.HASH, manifest.service_id),
+            2: (TypeCode.STRING, op),
+        }
+        if param_fields:
+            req_fields[3] = (TypeCode.MAP, param_fields)
+        if payment_proof is not None:
+            req_fields[4] = (TypeCode.BYTES, payment_proof)
+
+        response = await self._request(Verb.ROUTE, encode_payload(req_fields))
+        fields = decode_payload(response.payload) if response.payload else {}
+        return RouteResponse(
+            status_code=fields.get(1, (None, 0))[1],
+            body=fields.get(2, (None, b""))[1],
+            content_type=fields.get(3, (None, ""))[1],
+        )
 
     # ------------------------------------------------------------------
     # Wire-level request/response

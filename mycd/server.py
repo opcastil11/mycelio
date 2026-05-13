@@ -1,31 +1,39 @@
 """mycd — async TCP server speaking Mycelio v0.
 
-Phase 0 scope:
-- Accept TCP connections (no TLS yet — sandboxed env first)
-- Parse incoming frames
-- Handle PING (version negotiation, agent registration)
-- Handle DISCOVER against an in-memory service registry
-- Sign every server response with the root key (SIG frame)
-- Handle GOODBYE gracefully
+Phase 0 + 0.5 + 1 scope:
+- TLS-wrapped TCP listener
+- PING (version negotiation)
+- DISCOVER (in-memory service registry)
+- INSPECT (returns the manifest for a service_id)
+- ROUTE (translates to outbound HTTP and streams response back)
+- GOODBYE
 
-Future:
-- TLS termination (Phase 0.5)
-- ROUTE verb tunneling to vendor backends (Phase 1)
-- BENCH / CLAIM / PAY / INDEX (Phase 1+)
-- Mycelium peer gossip (Phase 2)
+The ROUTE handler is the "Rappi courier" — the agent sends one binary
+frame, mycd reads the vendor's manifest, builds an HTTP request to the
+vendor's existing backend, gets the response, and frames it back to
+the agent with an Ed25519 signature. The vendor never knew Mycelio
+existed.
 """
 from __future__ import annotations
 
 import logging
 import ssl
 from dataclasses import dataclass
+from typing import Any
 
 import anyio
+import httpx
 from anyio.abc import SocketStream
 from anyio.streams.tls import TLSListener
 
 from mycelio.crypto import sign_chain
 from mycelio.frame import HEADER_LEN, MAX_PAYLOAD, Frame, FrameError, decode_frame, encode_frame
+from mycelio.manifest import (
+    Manifest,
+    ManifestError,
+    ParamLocation,
+    encode_manifest,
+)
 from mycelio.payload import PayloadError, TypeCode, decode_payload, encode_payload
 from mycelio.verbs import Verb
 
@@ -57,13 +65,26 @@ class MycdServer:
         *,
         root_seed: bytes,
         services: list[ServiceEntry] | None = None,
+        manifests: list[Manifest] | None = None,
         protocol_version: int = 0,
         ssl_context: ssl.SSLContext | None = None,
+        http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self.root_seed = root_seed
         self.services = services or []
+        self.manifests_by_id: dict[bytes, Manifest] = {
+            m.service_id: m for m in (manifests or [])
+        }
         self.protocol_version = protocol_version
         self.ssl_context = ssl_context
+        # Outbound HTTP client for ROUTE translation. Tests inject a mock transport.
+        self._http_client = http_client or httpx.AsyncClient(timeout=30)
+        # Track whether we own the httpx client (so we close it on shutdown).
+        self._owns_http_client = http_client is None
+
+    async def aclose(self) -> None:
+        if self._owns_http_client:
+            await self._http_client.aclose()
 
     async def serve(self, host: str, port: int) -> None:
         """Run forever, accepting connections on (host, port).
@@ -122,6 +143,12 @@ class MycdServer:
         if frame.verb == Verb.DISCOVER:
             await self._handle_discover(stream, frame)
             return False
+        if frame.verb == Verb.INSPECT:
+            await self._handle_inspect(stream, frame)
+            return False
+        if frame.verb == Verb.ROUTE:
+            await self._handle_route(stream, frame)
+            return False
         if frame.verb == Verb.GOODBYE:
             log.debug("client said goodbye on stream %d", frame.stream_id)
             return True
@@ -129,7 +156,7 @@ class MycdServer:
         # Unsupported verb — close per spec.
         await self._send_goodbye(
             stream,
-            reason=f"verb 0x{int(frame.verb):02x} not implemented in Phase 0",
+            reason=f"verb 0x{int(frame.verb):02x} not implemented",
             code=1,
         )
         return True
@@ -204,6 +231,121 @@ class MycdServer:
         response = Frame(verb=Verb.DISCOVER, stream_id=frame.stream_id, payload=payload)
         await self._send_signed(stream, [response])
 
+    async def _handle_inspect(self, stream: SocketStream, frame: Frame) -> None:
+        """Return the full manifest for a service_id.
+
+        Request: {1: service_id (8B hash)}
+        Response: {1: bytes (encoded manifest)} — the agent decodes locally.
+        """
+        try:
+            req = decode_payload(frame.payload) if frame.payload else {}
+        except PayloadError as exc:
+            await self._send_error(stream, frame, code="bad_payload", msg=str(exc))
+            return
+
+        service_id = req.get(1, (None, None))[1]
+        if not service_id:
+            await self._send_error(stream, frame, code="missing_service_id", msg="field 1 required")
+            return
+
+        manifest = self.manifests_by_id.get(service_id)
+        if manifest is None:
+            await self._send_error(
+                stream, frame, code="service_not_found",
+                msg=f"no manifest for service {service_id.hex()}",
+            )
+            return
+
+        try:
+            encoded = encode_manifest(manifest)
+        except ManifestError as exc:
+            await self._send_error(stream, frame, code="manifest_encode_failed", msg=str(exc))
+            return
+
+        response = Frame(
+            verb=Verb.INSPECT,
+            stream_id=frame.stream_id,
+            payload=encode_payload({1: (TypeCode.BYTES, encoded)}),
+        )
+        await self._send_signed(stream, [response])
+
+    async def _handle_route(self, stream: SocketStream, frame: Frame) -> None:
+        """Translate a Mycelio ROUTE into an outbound HTTP call.
+
+        Request fields (per spec):
+          1 service_id : hash
+          2 op         : string (the op slug)
+          3 params     : map of field-id -> value (sequential field IDs match
+                         the order of params in the manifest's op definition,
+                         starting at 1)
+          4 payment_proof : bytes (when required by op)
+
+        Response: {1: status_code, 2: body_bytes, 3: content_type}
+        """
+        try:
+            req = decode_payload(frame.payload) if frame.payload else {}
+        except PayloadError as exc:
+            await self._send_error(stream, frame, code="bad_payload", msg=str(exc))
+            return
+
+        service_id = req.get(1, (None, None))[1]
+        op_slug = req.get(2, (None, None))[1]
+        params_map = req.get(3, (None, {}))[1]  # dict[int, (TypeCode, value)]
+        payment_proof = req.get(4, (None, None))[1]
+
+        if not service_id or not op_slug:
+            await self._send_error(stream, frame, code="missing_fields", msg="service_id and op required")
+            return
+
+        manifest = self.manifests_by_id.get(service_id)
+        if manifest is None:
+            await self._send_error(
+                stream, frame, code="service_not_found",
+                msg=f"no manifest for service {service_id.hex()}",
+            )
+            return
+
+        try:
+            op = manifest.get_op(op_slug)
+        except ManifestError as exc:
+            await self._send_error(stream, frame, code="op_not_found", msg=str(exc))
+            return
+
+        if op.requires_payment and not payment_proof:
+            await self._send_error(stream, frame, code="payment_required", msg="x402 proof required")
+            return
+
+        # Build the outbound HTTP request from the manifest + params.
+        try:
+            method, url, query, body, headers = _build_outbound_request(
+                manifest, op, params_map,
+            )
+        except _BuildError as exc:
+            await self._send_error(stream, frame, code="bad_params", msg=str(exc))
+            return
+
+        log.debug("route %s.%s → %s %s", manifest.slug, op_slug, method, url)
+
+        try:
+            backend_response = await self._http_client.request(
+                method, url, params=query, json=body if body else None, headers=headers,
+            )
+        except httpx.HTTPError as exc:
+            log.warning("route backend error %s: %s", url, exc)
+            await self._send_error(stream, frame, code="backend_unreachable", msg=str(exc))
+            return
+
+        content_type = backend_response.headers.get("content-type", "")
+        response_payload = encode_payload(
+            {
+                1: (TypeCode.U32, backend_response.status_code),
+                2: (TypeCode.BYTES, backend_response.content),
+                3: (TypeCode.STRING, content_type),
+            }
+        )
+        response = Frame(verb=Verb.ROUTE, stream_id=frame.stream_id, payload=response_payload)
+        await self._send_signed(stream, [response])
+
     # ------------------------------------------------------------------
     # Outbound helpers
     # ------------------------------------------------------------------
@@ -249,3 +391,87 @@ class MycdServer:
             await stream.send(encode_frame(bye))
         except (anyio.BrokenResourceError, anyio.ClosedResourceError):
             pass
+
+
+class _BuildError(Exception):
+    """Raised when an outbound request can't be built from a ROUTE payload."""
+
+
+def _pyify(type_code: TypeCode, value: Any) -> Any:
+    """Convert a (TypeCode, value) tuple from a decoded payload into a plain
+    Python value usable in URL/JSON/header contexts."""
+    if type_code == TypeCode.BYTES:
+        # Best-effort: try utf-8, otherwise hex. Most params are strings.
+        try:
+            return value.decode("utf-8")
+        except UnicodeDecodeError:
+            return value.hex()
+    return value
+
+
+def _build_outbound_request(
+    manifest: Manifest,
+    op,
+    params_map: dict,
+) -> tuple[str, str, dict, dict, dict]:
+    """Translate a ROUTE request into (method, url, query, body, headers).
+
+    Param-passing convention (v0):
+    - Field ID `n` in `params_map` corresponds to param at index `n-1` in
+      `op.params`. So field 1 = first param, field 2 = second, etc.
+    - This is what the agent gets back from INSPECT — the manifest's
+      param order is the agent's wire-level field ordering.
+
+    Params with `location = PATH` are substituted into `op.path` placeholders.
+    Params with `location = QUERY` go into URL query string.
+    Params with `location = BODY` go into the JSON body.
+    Params with `location = HEADER` go into HTTP headers.
+
+    Required-but-missing params raise _BuildError.
+    """
+    # Build a name -> python value map by walking the manifest's param order.
+    values: dict[str, Any] = {}
+    for idx, p in enumerate(op.params, start=1):
+        cell = params_map.get(idx)
+        if cell is None:
+            if p.required:
+                raise _BuildError(f"missing required param: {p.key!r}")
+            continue
+        type_code, raw = cell
+        values[p.key] = _pyify(type_code, raw)
+
+    # Substitute path templates.
+    path = op.path
+    for p in op.params:
+        if p.location == ParamLocation.PATH and p.key in values:
+            placeholder = "{" + p.out_name + "}"
+            path = path.replace(placeholder, str(values[p.key]))
+
+    url = manifest.backend_url.rstrip("/") + (path if path.startswith("/") else "/" + path)
+
+    query: dict[str, Any] = {}
+    body: dict[str, Any] = {}
+    headers: dict[str, str] = {}
+    for p in op.params:
+        if p.key not in values:
+            continue
+        v = values[p.key]
+        if p.location == ParamLocation.QUERY:
+            query[p.out_name] = v
+        elif p.location == ParamLocation.BODY:
+            body[p.out_name] = v
+        elif p.location == ParamLocation.HEADER:
+            headers[p.out_name] = str(v)
+        # PATH already substituted above.
+
+    # Inject vendor auth credentials if the manifest declares them.
+    if manifest.auth_header:
+        # In production: mycd would resolve the vendor's secret from a vault.
+        # For Phase 1: we pass through whatever's set in the manifest (the
+        # vault integration comes from Prowl as part of the M-series gateway
+        # work).
+        token = "MYCD_VENDOR_TOKEN"
+        prefix = manifest.auth_prefix
+        headers[manifest.auth_header] = f"{prefix} {token}".strip() if prefix else token
+
+    return op.method.upper(), url, query, body, headers

@@ -3,7 +3,7 @@
 See README.md and spec/protocol-v0.md for the protocol definition.
 """
 
-from mycelio.client import ClientError, DiscoverEntry, DiscoverResponse, MycelioClient
+from mycelio.client import ClientError, DiscoverEntry, DiscoverResponse, MycelioClient, RouteResponse
 from mycelio.crypto import (
     SignatureError,
     generate_keypair,
@@ -31,6 +31,7 @@ __all__ = [
     "FrameError",
     "MycelioClient",
     "PayloadError",
+    "RouteResponse",
     "SignatureError",
     "TypeCode",
     "Verb",
