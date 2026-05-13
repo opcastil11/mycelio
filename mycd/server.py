@@ -17,10 +17,12 @@ Future:
 from __future__ import annotations
 
 import logging
+import ssl
 from dataclasses import dataclass
 
 import anyio
 from anyio.abc import SocketStream
+from anyio.streams.tls import TLSListener
 
 from mycelio.crypto import sign_chain
 from mycelio.frame import HEADER_LEN, MAX_PAYLOAD, Frame, FrameError, decode_frame, encode_frame
@@ -56,15 +58,26 @@ class MycdServer:
         root_seed: bytes,
         services: list[ServiceEntry] | None = None,
         protocol_version: int = 0,
+        ssl_context: ssl.SSLContext | None = None,
     ) -> None:
         self.root_seed = root_seed
         self.services = services or []
         self.protocol_version = protocol_version
+        self.ssl_context = ssl_context
 
     async def serve(self, host: str, port: int) -> None:
-        """Run forever, accepting connections on (host, port)."""
-        listener = await anyio.create_tcp_listener(local_host=host, local_port=port)
-        log.info("mycd listening on %s:%s", host, port)
+        """Run forever, accepting connections on (host, port).
+
+        If `ssl_context` was provided at construction, the listener wraps
+        incoming connections in TLS; otherwise it's plain TCP.
+        """
+        tcp = await anyio.create_tcp_listener(local_host=host, local_port=port)
+        if self.ssl_context is not None:
+            listener = TLSListener(tcp, ssl_context=self.ssl_context)
+            log.info("mycd listening on %s:%s (TLS)", host, port)
+        else:
+            listener = tcp
+            log.info("mycd listening on %s:%s (plain TCP)", host, port)
         await listener.serve(self._handle_connection)
 
     # ------------------------------------------------------------------

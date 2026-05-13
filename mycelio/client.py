@@ -15,12 +15,14 @@ trust mechanism that lets us safely talk to peer relay nodes later.
 from __future__ import annotations
 
 import itertools
+import ssl
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import AsyncIterator
 
 import anyio
 from anyio.abc import SocketStream
+from anyio.streams.tls import TLSStream
 
 from mycelio.crypto import SignatureError, verify_chain
 from mycelio.frame import HEADER_LEN, Frame, FrameError, decode_frame, encode_frame
@@ -64,9 +66,27 @@ class MycelioClient:
     @classmethod
     @asynccontextmanager
     async def connect(
-        cls, host: str, port: int, *, root_pubkey: bytes
+        cls,
+        host: str,
+        port: int,
+        *,
+        root_pubkey: bytes,
+        ssl_context: ssl.SSLContext | None = None,
     ) -> AsyncIterator["MycelioClient"]:
+        """Open a Mycelio connection.
+
+        Pass `ssl_context` to enable TLS. The TLS-level identity (cert
+        chain) is independent from Mycelio's frame-chain signing — TLS
+        protects the bytes in transit, the root_pubkey verifies that
+        the directory authored what we receive.
+        """
         stream = await anyio.connect_tcp(host, port)
+        if ssl_context is not None:
+            stream = await TLSStream.wrap(
+                stream,
+                hostname=host,
+                ssl_context=ssl_context,
+            )
         client = cls(stream, root_pubkey)
         try:
             yield client

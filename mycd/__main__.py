@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import ssl
 import sys
 from pathlib import Path
 
@@ -55,13 +56,26 @@ def load_or_generate_root_key(path: str | None) -> tuple[bytes, bytes]:
     return seed, pub
 
 
+def build_ssl_context(cert_path: str, key_path: str) -> ssl.SSLContext:
+    ctx = ssl.create_default_context(purpose=ssl.Purpose.CLIENT_AUTH)
+    ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
+    return ctx
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="mycd", description="Mycelio reference daemon")
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=4242)
     parser.add_argument(
         "--root-key",
         help="Path to 32-byte Ed25519 private seed. Generated ephemerally if omitted.",
+    )
+    parser.add_argument("--tls-cert", help="Path to TLS certificate (PEM)")
+    parser.add_argument("--tls-key", help="Path to TLS private key (PEM)")
+    parser.add_argument(
+        "--self-signed",
+        action="store_true",
+        help="Generate a self-signed cert for the given --host. For dev only.",
     )
     parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument("--version", action="store_true")
@@ -77,7 +91,18 @@ def main() -> int:
     )
 
     seed, pub = load_or_generate_root_key(args.root_key)
-    server = MycdServer(root_seed=seed, services=DEMO_SERVICES)
+    print(f"root pubkey: {pub.hex()}", file=sys.stderr)
+
+    ssl_ctx: ssl.SSLContext | None = None
+    if args.tls_cert and args.tls_key:
+        ssl_ctx = build_ssl_context(args.tls_cert, args.tls_key)
+        print(f"TLS enabled (cert: {args.tls_cert})", file=sys.stderr)
+    elif args.self_signed:
+        from mycelio.tls_dev import make_server_context
+        ssl_ctx, _ = make_server_context(common_name=args.host)
+        print("TLS enabled (self-signed — dev only)", file=sys.stderr)
+
+    server = MycdServer(root_seed=seed, services=DEMO_SERVICES, ssl_context=ssl_ctx)
 
     try:
         anyio.run(server.serve, args.host, args.port)
