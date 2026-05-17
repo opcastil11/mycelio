@@ -150,6 +150,26 @@ def encode_manifest(m: Manifest) -> bytes:
     return _encode_core(m, include_vendor_sig=True, include_dir_sig=True)
 
 
+def encode_unsigned_manifest(m: Manifest) -> bytes:
+    """Encode just the core fields (no signatures).
+
+    This is the byte string that :func:`sign_vendor` signs over — useful for
+    previewing a manifest before any signatures are attached, or for
+    handing to an offline signer.
+    """
+    return _encode_core(m, include_vendor_sig=False, include_dir_sig=False)
+
+
+def encode_vendor_signed_manifest(m: Manifest) -> bytes:
+    """Encode the manifest with the vendor signature but no directory sig.
+
+    This is what a vendor submits to the directory when requesting a
+    countersignature. Raises :class:`ManifestError` if the manifest has
+    not been vendor-signed yet.
+    """
+    return _encode_core(m, include_vendor_sig=True, include_dir_sig=False)
+
+
 def _decode_param(raw: dict[int, tuple[TypeCode, Any]]) -> ParamDef:
     key = raw[1][1]
     loc = ParamLocation(raw[2][1])
