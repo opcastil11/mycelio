@@ -65,16 +65,16 @@ endorsement before invoking.
 ## Status
 
 **v0 — experimental.** Reference daemon `mycd` is live on the public
-internet at `myc://mycelio.prowl.world:4242` for poking at. 63 tests
-cover frame codec, crypto, manifest signing, and end-to-end `ROUTE`
-through a mocked HTTP backend.
+internet at `myc://mycelio.prowl.world:4242` for poking at. 89 tests
+cover frame codec, crypto, manifest signing, OpenAPI → manifest codegen,
+and end-to-end `ROUTE` through a mocked HTTP backend.
 
 Phase progress:
 
 - [x] **Phase 0** — wire spec v0, frame codec, 10 verbs defined
 - [x] **Phase 0.5** — TLS support, async daemon, signature-verifying SDK
 - [x] **Phase 1** — vendor manifests, dual signing, `INSPECT`, `ROUTE` over real HTTP
-- [ ] **Phase 2** — **Prowl Design**: auto-generate signed manifests from OpenAPI via `prowl-bench design manifest`
+- [⏳] **Phase 2** — **Prowl Design**: auto-generate signed manifests from OpenAPI via `prowl-bench design manifest`. Foundation function `mycelio.codegen.manifest_from_openapi()` shipped 2026-05-17 (26 tests).
 
 Reserved in spec but not on the active roadmap: streaming responses through `ROUTE`, peer-to-peer shard relay, and the `BENCH` / `CLAIM` / `PAY` / `INDEX` verbs. These stay defined in the spec so implementations can grow into them; the protocol's job is done once Phase 2 ships.
 
