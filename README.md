@@ -56,9 +56,9 @@ endorsement before invoking.
 ## Status
 
 **v0 — experimental.** Reference daemon `mycd` is live on the public
-internet at `myc://34.57.91.26:4242` for poking at. 63 tests cover frame
-codec, crypto, manifest signing, and end-to-end `ROUTE` through a mocked
-HTTP backend.
+internet at `myc://mycelio.prowl.world:4242` for poking at. 63 tests
+cover frame codec, crypto, manifest signing, and end-to-end `ROUTE`
+through a mocked HTTP backend.
 
 Phase progress:
 
@@ -91,7 +91,7 @@ import asyncio
 from mycelio.client import MycelioClient
 
 async def main():
-    async with MycelioClient("34.57.91.26", 4242) as c:
+    async with MycelioClient("mycelio.prowl.world", 4242) as c:
         services = await c.discover(category="payments")
         for s in services:
             print(s.name, s.hash.hex()[:16])
