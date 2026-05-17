@@ -74,10 +74,9 @@ Phase progress:
 - [x] **Phase 0** — wire spec v0, frame codec, 10 verbs defined
 - [x] **Phase 0.5** — TLS support, async daemon, signature-verifying SDK
 - [x] **Phase 1** — vendor manifests, dual signing, `INSPECT`, `ROUTE` over real HTTP
-- [ ] **Phase 2** — endpoint design bench: auto-generate manifests from OpenAPI
-- [ ] **Phase 3** — streaming responses (SSE/chunked through `ROUTE`) + `PAY` (x402)
-- [ ] **Phase 4** — peer-to-peer relay of signed directory shards
-- [ ] **Phase 5** — public 1.0, multi-language reference implementations, conformance suite
+- [ ] **Phase 2** — **Prowl Design**: auto-generate signed manifests from OpenAPI via `prowl-bench design manifest`
+
+Reserved in spec but not on the active roadmap: streaming responses through `ROUTE`, peer-to-peer shard relay, and the `BENCH` / `CLAIM` / `PAY` / `INDEX` verbs. These stay defined in the spec so implementations can grow into them; the protocol's job is done once Phase 2 ships.
 
 Production directory implementation lives at [prowl.world](https://prowl.world).
 
@@ -141,12 +140,14 @@ manifests; see [`spec/manifest-v0.md`](spec/manifest-v0.md).
 | `0x02` | `DISCOVER` | Find services by category / query / filter | ✅ |
 | `0x03` | `INSPECT` | Get full metadata for one service | ✅ |
 | `0x04` | `ROUTE` | Invoke a service through the tunnel | ✅ |
-| `0x05` | `BENCH` | Submit benchmark result | Phase 3 |
-| `0x06` | `CLAIM` | Verify vendor ownership | Phase 3 |
-| `0x07` | `PAY` | x402 payment proof | Phase 3 |
-| `0x08` | `INDEX` | Request a directory shard (relay nodes) | Phase 4 |
+| `0x05` | `BENCH` | Submit benchmark result | Reserved |
+| `0x06` | `CLAIM` | Verify vendor ownership | Reserved |
+| `0x07` | `PAY` | x402 payment proof | Reserved¹ |
+| `0x08` | `INDEX` | Request a directory shard (relay nodes) | Reserved |
 | `0xFE` | `SIG` | Ed25519 signature over preceding frames | ✅ |
 | `0xFF` | `GOODBYE` | Close connection | ✅ |
+
+¹ x402 payments work today over HTTP at the directory layer; the binary `PAY` verb stays reserved so agents that prefer Mycelio-only can grow into it later.
 
 Full wire spec: [`spec/protocol-v0.md`](spec/protocol-v0.md).
 Manifest format: [`spec/manifest-v0.md`](spec/manifest-v0.md).
