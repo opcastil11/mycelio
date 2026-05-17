@@ -418,6 +418,17 @@ def test_raises_on_empty_servers_url():
         manifest_from_openapi(spec, vendor_pubkey=vendor_pub, directory_pubkey=dir_pub)
 
 
+def test_raises_on_relative_server_url():
+    """A common footgun in tutorial specs (Petstore et al). Relative
+    servers can't produce a usable backend URL — the manifest would
+    point nowhere."""
+    spec = _stripe_like_spec()
+    spec["servers"] = [{"url": "/api/v3"}]
+    _, vendor_pub, _, dir_pub = _vendor_and_dir_keys()
+    with pytest.raises(CodegenError, match="absolute URL"):
+        manifest_from_openapi(spec, vendor_pubkey=vendor_pub, directory_pubkey=dir_pub)
+
+
 def test_raises_on_no_operations():
     spec = _stripe_like_spec()
     spec["paths"] = {}

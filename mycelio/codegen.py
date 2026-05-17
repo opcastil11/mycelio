@@ -204,6 +204,13 @@ def _backend_url(spec: dict) -> str:
     url = (servers[0].get("url") or "").rstrip("/")
     if not url:
         raise CodegenError("servers[0].url is empty")
+    if not url.startswith(("http://", "https://")):
+        raise CodegenError(
+            f"servers[0].url must be an absolute URL with http(s) scheme; "
+            f"got {url!r}. Specs with relative servers (common in tutorials) "
+            "cannot produce a useful manifest — override servers[0].url to "
+            "the actual backend host before generating."
+        )
     return url
 
 
