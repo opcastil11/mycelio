@@ -1,0 +1,23 @@
+<svg width="260" height="64" viewBox="0 0 260 64" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Mycelio">
+  <title>Mycelio</title>
+  <g stroke="#6ee7b7" stroke-linecap="round" fill="#6ee7b7">
+    <path d="M14 14 L32 32" stroke-width="2" fill="none"/>
+    <path d="M14 50 L32 32" stroke-width="2" fill="none"/>
+    <path d="M32 32 L54 14" stroke-width="2" fill="none"/>
+    <path d="M32 32 L54 50" stroke-width="2" fill="none"/>
+    <path d="M54 14 L72 14" stroke-width="1.5" fill="none"/>
+    <path d="M54 50 L72 50" stroke-width="1.5" fill="none"/>
+    <path d="M54 14 L62 6" stroke-width="1.5" fill="none"/>
+    <path d="M54 50 L62 58" stroke-width="1.5" fill="none"/>
+    <circle cx="14" cy="14" r="3.5"/>
+    <circle cx="14" cy="50" r="3.5"/>
+    <circle cx="32" cy="32" r="5"/>
+    <circle cx="54" cy="14" r="3.5"/>
+    <circle cx="54" cy="50" r="3.5"/>
+    <circle cx="72" cy="14" r="2.5"/>
+    <circle cx="72" cy="50" r="2.5"/>
+    <circle cx="62" cy="6" r="2"/>
+    <circle cx="62" cy="58" r="2"/>
+  </g>
+  <text x="92" y="42" font-family="ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace" font-size="28" font-weight="600" fill="#e6e8ec" letter-spacing="-0.5">mycelio</text>
+</svg>

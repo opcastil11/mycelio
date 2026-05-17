@@ -1,13 +1,22 @@
-# Mycelio
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+    <img src="assets/logo-light.svg" alt="Mycelio" width="260">
+  </picture>
+</p>
 
-Binary, agent-native protocol for AI agents to discover and invoke SaaS
-services without speaking HTTP+JSON.
+<p align="center">
+  <strong>Binary, agent-native protocol for AI agents to discover and invoke SaaS services without speaking HTTP+JSON.</strong>
+</p>
+
+<p align="center">
+  <a href="LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/License-Apache_2.0-blue.svg"></a>
+  <a href="#status"><img alt="Status: experimental" src="https://img.shields.io/badge/status-experimental-orange.svg"></a>
+  <a href="https://www.python.org/"><img alt="Python 3.11+" src="https://img.shields.io/badge/python-3.11+-blue.svg"></a>
+  <a href="https://mycelio.prowl.world/"><img alt="Live daemon" src="https://img.shields.io/badge/daemon-live-success.svg"></a>
+</p>
 
 > HTTP+JSON is for browsers. Mycelio is for agents.
-
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Status: experimental](https://img.shields.io/badge/status-experimental-orange.svg)](#status)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 
 ## Why
 
