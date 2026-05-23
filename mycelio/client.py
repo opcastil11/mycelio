@@ -273,13 +273,7 @@ class MycelioClient:
         response = await self._request(Verb.FETCH, encode_payload(req_fields))
         fields = decode_payload(response.payload) if response.payload else {}
 
-        affordances_field = fields.get(4)
-        affordances: list[dict[str, Any]] = []
-        if affordances_field is not None:
-            for sub_type, entry in affordances_field[1]:
-                if sub_type != TypeCode.MAP:
-                    continue
-                affordances.append({fid: cell[1] for fid, cell in entry.items()})
+        affordances = _parse_affordances_field(fields.get(4))
 
         return FetchResponse(
             source=fields.get(1, (None, "heuristic"))[1],
@@ -352,24 +346,73 @@ class MycelioClient:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _parse_discover(payload: bytes) -> DiscoverResponse:
-        if not payload:
-            return DiscoverResponse()
-        fields = decode_payload(payload)
-        results: list[DiscoverEntry] = []
-        if 1 in fields:
-            _, raw_array = fields[1]
-            for sub_type, entry in raw_array:
-                if sub_type != TypeCode.MAP:
-                    continue
-                results.append(
-                    DiscoverEntry(
-                        service_id=entry[1][1],
-                        score=entry[2][1],
-                        cat_flags=entry[3][1],
-                        proto_flags=entry[4][1],
-                        name=entry[5][1],
-                    )
+    def _parse_discover(payload: bytes) -> DiscoverResponse:  # noqa: D401
+        return _parse_discover_impl(payload)
+
+
+def _parse_affordances_field(field_cell) -> list[dict[str, Any]]:
+    """Decode the FETCH affordances array (field 4) into named-key dicts.
+
+    Wire shape per affordance:
+        1: kind, 2: target, 3: label, 4: hints (map)
+    Hints (form):  1: method, 2: fields[{1:name,2:type,3:required}]
+    Hints (op):    1: method, 3: path
+    """
+    if field_cell is None:
+        return []
+    out: list[dict[str, Any]] = []
+    for sub_type, entry in field_cell[1]:
+        if sub_type != TypeCode.MAP:
+            continue
+        aff: dict[str, Any] = {}
+        if 1 in entry:
+            aff["kind"] = entry[1][1]
+        if 2 in entry:
+            aff["target"] = entry[2][1]
+        if 3 in entry:
+            aff["label"] = entry[3][1]
+        if 4 in entry:
+            hints_map = entry[4][1]
+            hints: dict[str, Any] = {}
+            if 1 in hints_map:
+                hints["method"] = hints_map[1][1]
+            if 2 in hints_map:
+                f_list: list[dict[str, Any]] = []
+                for st, fmap in hints_map[2][1]:
+                    if st != TypeCode.MAP:
+                        continue
+                    f_list.append({
+                        "name": fmap.get(1, (None, ""))[1],
+                        "type": fmap.get(2, (None, "text"))[1],
+                        "required": fmap.get(3, (None, False))[1],
+                    })
+                hints["fields"] = f_list
+            if 3 in hints_map:
+                hints["path"] = hints_map[3][1]
+            if hints:
+                aff["hints"] = hints
+        out.append(aff)
+    return out
+
+
+def _parse_discover_impl(payload: bytes) -> DiscoverResponse:
+    if not payload:
+        return DiscoverResponse()
+    fields = decode_payload(payload)
+    results: list[DiscoverEntry] = []
+    if 1 in fields:
+        _, raw_array = fields[1]
+        for sub_type, entry in raw_array:
+            if sub_type != TypeCode.MAP:
+                continue
+            results.append(
+                DiscoverEntry(
+                    service_id=entry[1][1],
+                    score=entry[2][1],
+                    cat_flags=entry[3][1],
+                    proto_flags=entry[4][1],
+                    name=entry[5][1],
                 )
-        total = fields.get(2, (None, 0))[1]
-        return DiscoverResponse(results=results, total=total)
+            )
+    total = fields.get(2, (None, 0))[1]
+    return DiscoverResponse(results=results, total=total)

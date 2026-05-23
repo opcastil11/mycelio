@@ -14,12 +14,15 @@ httpx transports for either path.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 from urllib.parse import urlparse
 from urllib.robotparser import RobotFileParser
 
 import httpx
 import trafilatura
+
+from mycd.affordances import parse_affordances
 
 DEFAULT_MAX_BYTES = 256 * 1024
 DEFAULT_USER_AGENT = "MycelioFetch/0 (+https://mycelio.prowl.world)"
@@ -32,12 +35,14 @@ JINA_READER_BASE = "https://r.jina.ai"
 @dataclass
 class ExtractedContent:
     """A successful extraction. `final_url` reflects any redirects.
-    `engine` is which path succeeded — informational, not on the wire."""
+    `engine` is which path succeeded — informational, not on the wire.
+    `affordances` is empty on the Jina path (we don't have raw HTML)."""
 
     content: str
     fetched_at: int
     final_url: str
     engine: str  # "trafilatura" | "jina"
+    affordances: list[dict[str, Any]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +168,7 @@ async def _try_local(
         fetched_at=int(time.time()),
         final_url=str(response.url),
         engine="trafilatura",
+        affordances=parse_affordances(body, str(response.url)),
     )
 
 

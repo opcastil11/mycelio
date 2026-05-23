@@ -250,7 +250,7 @@ Response:
 | 1 | `source` | `string` | `"manifest"` \| `"heuristic"`. |
 | 2 | `signed` | `bool` | True only when `source == "manifest"`. |
 | 3 | `content` | `string` | Extracted Markdown. |
-| 4 | `affordances` | `array<map>` | Inferred links / forms. Each map: `{kind, target, label}`. Empty in P1. |
+| 4 | `affordances` | `array<map>` | Inferred links / forms (heuristic) or manifest ops (manifest path). Each entry: `{1:kind, 2:target, 3:label, 4:hints?}`. Hint keys: `1:method, 2:fields[{1:name,2:type,3:required}], 3:path`. |
 | 5 | `fetched_at` | `u64` | Unix seconds. |
 | 6 | `ttl_seconds` | `u32` | How long the daemon's cache will keep this entry. |
 

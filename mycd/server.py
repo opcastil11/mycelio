@@ -21,6 +21,7 @@ import ssl
 import time
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse
 
 import anyio
 import httpx
@@ -88,6 +89,13 @@ class MycdServer:
         self.manifests_by_id: dict[bytes, Manifest] = {
             m.service_id: m for m in (manifests or [])
         }
+        # Host → Manifest, derived from each manifest's backend_url. Used by
+        # FETCH for the manifest-graduation path (P3).
+        self.manifests_by_host: dict[str, Manifest] = {}
+        for m in (manifests or []):
+            host = urlparse(m.backend_url).hostname
+            if host:
+                self.manifests_by_host[host.lower()] = m
         self.protocol_version = protocol_version
         self.ssl_context = ssl_context
         # Outbound HTTP client for ROUTE translation. Tests inject a mock transport.
@@ -406,8 +414,19 @@ class MycdServer:
                 return
             self._fetch_cache.pop(url, None)
 
-        # TODO(P3): if a manifest is registered for the host, return it
-        # with source="manifest", signed=True. Skipped in P1.
+        # P3 — manifest graduation. If the host ships a signed manifest,
+        # return that instead of scraping. Same response shape, agent
+        # code doesn't change; affordances now carry typed ops.
+        target_host = (urlparse(url).hostname or "").lower()
+        manifest = self.manifests_by_host.get(target_host)
+        if manifest is not None:
+            extracted = _build_manifest_extracted(manifest, url, now)
+            await self._send_fetch_response(
+                stream, frame, extracted,
+                source="manifest", signed=True,
+                ttl_seconds=self._fetch_ttl_seconds,
+            )
+            return
 
         try:
             extracted = await fetch_and_extract(
@@ -445,12 +464,15 @@ class MycdServer:
         signed: bool,
         ttl_seconds: int,
     ) -> None:
+        affordances_array = [
+            _encode_affordance(aff) for aff in extracted.affordances
+        ]
         payload = encode_payload(
             {
                 1: (TypeCode.STRING, source),
                 2: (TypeCode.BOOL, signed),
                 3: (TypeCode.STRING, extracted.content),
-                4: (TypeCode.ARRAY, []),  # affordances — P2
+                4: (TypeCode.ARRAY, affordances_array),
                 5: (TypeCode.U64, extracted.fetched_at),
                 6: (TypeCode.U32, ttl_seconds),
             }
@@ -507,6 +529,78 @@ class MycdServer:
             await stream.send(encode_frame(bye))
         except (anyio.BrokenResourceError, anyio.ClosedResourceError):
             pass
+
+
+def _build_manifest_extracted(manifest: Manifest, url: str, now: int) -> ExtractedContent:
+    """Render a signed manifest into the FETCH response shape.
+
+    Content is a short Markdown summary; affordances are the manifest's
+    ops as ``kind="op"`` entries the agent can hand to ROUTE.
+    """
+    op_lines = [
+        f"- `{op.slug}` — {op.method.upper()} {op.path}"
+        for op in manifest.ops
+    ]
+    content = (
+        f"# {manifest.slug}\n\n"
+        f"Signed Mycelio manifest. {len(manifest.ops)} operation(s):\n\n"
+        + "\n".join(op_lines)
+        + "\n\nInvoke any op by slug via ROUTE."
+    )
+    affordances = [
+        {
+            "kind": "op",
+            "target": op.slug,
+            "label": f"{op.method.upper()} {op.path}",
+            "hints": {"method": op.method.upper(), "path": op.path},
+        }
+        for op in manifest.ops
+    ]
+    return ExtractedContent(
+        content=content,
+        fetched_at=now,
+        final_url=url,
+        engine="manifest",
+        affordances=affordances,
+    )
+
+
+def _encode_affordance(aff: dict[str, Any]) -> tuple[TypeCode, dict]:
+    """Convert a parsed affordance dict to a (TypeCode.MAP, encoded) entry
+    suitable for the FETCH response affordances array.
+
+    Wire fields per affordance:
+        1: kind (string)
+        2: target (string)
+        3: label (string)
+        4: hints (map, optional) — for forms: {1: method, 2: fields[]};
+           for ops: {1: method, 3: path}
+    """
+    out: dict[int, tuple[TypeCode, Any]] = {
+        1: (TypeCode.STRING, aff["kind"]),
+        2: (TypeCode.STRING, aff["target"]),
+        3: (TypeCode.STRING, aff["label"]),
+    }
+    hints = aff.get("hints") or {}
+    hint_map: dict[int, tuple[TypeCode, Any]] = {}
+    if "method" in hints:
+        hint_map[1] = (TypeCode.STRING, hints["method"])
+    if "fields" in hints:
+        entries: list[tuple[TypeCode, Any]] = []
+        for f in hints["fields"]:
+            entries.append(
+                (TypeCode.MAP, {
+                    1: (TypeCode.STRING, f.get("name", "")),
+                    2: (TypeCode.STRING, f.get("type", "text")),
+                    3: (TypeCode.BOOL, bool(f.get("required", False))),
+                })
+            )
+        hint_map[2] = (TypeCode.ARRAY, entries)
+    if "path" in hints:
+        hint_map[3] = (TypeCode.STRING, hints["path"])
+    if hint_map:
+        out[4] = (TypeCode.MAP, hint_map)
+    return (TypeCode.MAP, out)
 
 
 class _BuildError(Exception):
