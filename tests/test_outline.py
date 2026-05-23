@@ -75,6 +75,24 @@ def test_structural_handles_garbage_input():
     assert structural_sections(b"<this is not html") in ([], [])  # tolerant
 
 
+def test_structural_skips_comment_nodes_between_headings():
+    """Regression: HTML comments between siblings used to crash
+    ``node.text_content()`` because Comment nodes aren't elements."""
+    html = b"""<html><body>
+<h1>Top</h1>
+<p>intro text</p>
+<!-- this comment used to blow us up -->
+<p>more text</p>
+<h2>Next</h2>
+<p>section two</p>
+</body></html>"""
+    secs = structural_sections(html)
+    ids = [s.id for s in secs]
+    assert ids == ["top", "next"]
+    assert "intro text" in secs[0].content
+    assert "more text" in secs[0].content
+
+
 def test_slugify_basics():
     assert _slugify("Hello World") == "hello-world"
     assert _slugify("  Mixed -- Case 42!! ") == "mixed-case-42"

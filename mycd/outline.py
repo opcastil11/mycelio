@@ -107,9 +107,14 @@ def structural_sections(body: bytes) -> list[Section]:
         sid = _unique_slug(_slugify(heading), used_ids)
 
         # Walk forward in document order until the next heading.
+        # Skip non-element nodes (comments, processing instructions) — their
+        # ``.tag`` isn't a string and ``.text_content()`` would raise.
         parts: list[str] = []
         node = h.getnext()
         while node is not None:
+            if not isinstance(node.tag, str):
+                node = node.getnext()
+                continue
             if node.tag in _HEADINGS:
                 break
             text = (node.text_content() or "").strip()
