@@ -14,7 +14,7 @@ COPY mycd/ ./mycd/
 # Install into the builder venv, then copy to the runtime stage.
 RUN python -m venv /opt/venv && \
     /opt/venv/bin/pip install --no-cache-dir --upgrade pip && \
-    /opt/venv/bin/pip install --no-cache-dir ".[server]"
+    /opt/venv/bin/pip install --no-cache-dir ".[server,shim]"
 
 
 FROM python:3.12-slim AS runtime
@@ -30,7 +30,6 @@ USER mycelio
 
 EXPOSE 4242
 
-# Default command — override args via docker run / compose.
-# In production: pass --tls-cert, --tls-key, --root-key.
-ENTRYPOINT ["mycd"]
-CMD ["--host", "0.0.0.0", "--port", "4242"]
+# Default command runs the daemon. Compose overrides ``command:`` to run
+# the HTTP shim (``python -m mycd.http_shim``) in a separate container.
+CMD ["mycd", "--host", "0.0.0.0", "--port", "4242"]
