@@ -19,6 +19,7 @@ class Verb(IntEnum):
     CLAIM = 0x06
     PAY = 0x07
     INDEX = 0x08
+    FETCH = 0x09
 
     SIG = 0xFE
     GOODBYE = 0xFF

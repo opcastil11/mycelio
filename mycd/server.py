@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import ssl
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -26,6 +27,12 @@ import httpx
 from anyio.abc import SocketStream
 from anyio.streams.tls import TLSListener
 
+from mycd.extractor import (
+    DEFAULT_MAX_BYTES,
+    ExtractedContent,
+    ExtractorError,
+    fetch_and_extract,
+)
 from mycelio.crypto import sign_chain
 from mycelio.frame import HEADER_LEN, MAX_PAYLOAD, Frame, FrameError, decode_frame, encode_frame
 from mycelio.manifest import (
@@ -36,6 +43,9 @@ from mycelio.manifest import (
 )
 from mycelio.payload import PayloadError, TypeCode, decode_payload, encode_payload
 from mycelio.verbs import Verb
+
+FETCH_CACHE_MAX = 1024
+DEFAULT_FETCH_TTL_SECONDS = 24 * 3600  # 24 h
 
 log = logging.getLogger("mycd.server")
 
@@ -69,6 +79,9 @@ class MycdServer:
         protocol_version: int = 0,
         ssl_context: ssl.SSLContext | None = None,
         http_client: httpx.AsyncClient | None = None,
+        respect_robots: bool = True,
+        fetch_ttl_seconds: int = DEFAULT_FETCH_TTL_SECONDS,
+        jina_fallback: bool = True,
     ) -> None:
         self.root_seed = root_seed
         self.services = services or []
@@ -81,6 +94,12 @@ class MycdServer:
         self._http_client = http_client or httpx.AsyncClient(timeout=30)
         # Track whether we own the httpx client (so we close it on shutdown).
         self._owns_http_client = http_client is None
+        # FETCH state — shared in-memory cache + robots cache across calls.
+        self._respect_robots = respect_robots
+        self._fetch_ttl_seconds = fetch_ttl_seconds
+        self._jina_fallback = jina_fallback
+        self._fetch_cache: dict[str, tuple[ExtractedContent, int]] = {}
+        self._robots_cache: dict[str, Any] = {}
 
     async def aclose(self) -> None:
         if self._owns_http_client:
@@ -148,6 +167,9 @@ class MycdServer:
             return False
         if frame.verb == Verb.ROUTE:
             await self._handle_route(stream, frame)
+            return False
+        if frame.verb == Verb.FETCH:
+            await self._handle_fetch(stream, frame)
             return False
         if frame.verb == Verb.GOODBYE:
             log.debug("client said goodbye on stream %d", frame.stream_id)
@@ -344,6 +366,100 @@ class MycdServer:
             }
         )
         response = Frame(verb=Verb.ROUTE, stream_id=frame.stream_id, payload=response_payload)
+        await self._send_signed(stream, [response])
+
+    async def _handle_fetch(self, stream: SocketStream, frame: Frame) -> None:
+        """Heuristic content extraction for any URL. P1: trafilatura + Jina fallback.
+
+        Request fields:
+          1 url        : string (required)
+          2 max_bytes  : u32 (optional, default 256 KiB)
+          3 affordances: bool (optional, ignored in P1)
+
+        Response: {1: source, 2: signed, 3: content, 4: affordances,
+                   5: fetched_at, 6: ttl_seconds}.
+        """
+        try:
+            req = decode_payload(frame.payload) if frame.payload else {}
+        except PayloadError as exc:
+            await self._send_error(stream, frame, code="bad_payload", msg=str(exc))
+            return
+
+        url = req.get(1, (None, None))[1]
+        if not url:
+            await self._send_error(stream, frame, code="bad_url", msg="field 1 (url) required")
+            return
+
+        mb_field = req.get(2)
+        max_bytes = mb_field[1] if mb_field and mb_field[1] > 0 else DEFAULT_MAX_BYTES
+
+        now = int(time.time())
+        cached = self._fetch_cache.get(url)
+        if cached is not None:
+            extracted, expires_at = cached
+            if expires_at > now:
+                await self._send_fetch_response(
+                    stream, frame, extracted,
+                    source="heuristic", signed=False,
+                    ttl_seconds=expires_at - now,
+                )
+                return
+            self._fetch_cache.pop(url, None)
+
+        # TODO(P3): if a manifest is registered for the host, return it
+        # with source="manifest", signed=True. Skipped in P1.
+
+        try:
+            extracted = await fetch_and_extract(
+                url,
+                http_client=self._http_client,
+                max_bytes=max_bytes,
+                respect_robots=self._respect_robots,
+                robots_cache=self._robots_cache,
+                jina_fallback=self._jina_fallback,
+            )
+        except ExtractorError as exc:
+            await self._send_error(stream, frame, code=exc.code, msg=exc.message)
+            return
+
+        expires_at = now + self._fetch_ttl_seconds
+        if len(self._fetch_cache) >= FETCH_CACHE_MAX:
+            # Evict the oldest entry (dict preserves insertion order).
+            self._fetch_cache.pop(next(iter(self._fetch_cache)))
+        self._fetch_cache[url] = (extracted, expires_at)
+
+        log.debug("fetch %s via %s (%d chars)", url, extracted.engine, len(extracted.content))
+        await self._send_fetch_response(
+            stream, frame, extracted,
+            source="heuristic", signed=False,
+            ttl_seconds=self._fetch_ttl_seconds,
+        )
+
+    async def _send_fetch_response(
+        self,
+        stream: SocketStream,
+        request_frame: Frame,
+        extracted: ExtractedContent,
+        *,
+        source: str,
+        signed: bool,
+        ttl_seconds: int,
+    ) -> None:
+        payload = encode_payload(
+            {
+                1: (TypeCode.STRING, source),
+                2: (TypeCode.BOOL, signed),
+                3: (TypeCode.STRING, extracted.content),
+                4: (TypeCode.ARRAY, []),  # affordances — P2
+                5: (TypeCode.U64, extracted.fetched_at),
+                6: (TypeCode.U32, ttl_seconds),
+            }
+        )
+        response = Frame(
+            verb=Verb.FETCH,
+            stream_id=request_frame.stream_id,
+            payload=payload,
+        )
         await self._send_signed(stream, [response])
 
     # ------------------------------------------------------------------

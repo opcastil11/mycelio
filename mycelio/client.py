@@ -69,6 +69,23 @@ class RouteResponse:
         return self.body.decode("utf-8", errors="replace")
 
 
+@dataclass
+class FetchResponse:
+    """A response from a FETCH call.
+
+    `source` is `"heuristic"` (daemon scraped + extracted) or `"manifest"`
+    (host ships a signed Mycelio manifest, returned verbatim). `signed`
+    is true only on the manifest path. The envelope is always SIG-framed.
+    """
+
+    source: str
+    signed: bool
+    content: str
+    affordances: list[dict[str, Any]] = field(default_factory=list)
+    fetched_at: int = 0
+    ttl_seconds: int = 0
+
+
 class MycelioClient:
     """One persistent connection. Streams allocated lazily."""
 
@@ -229,6 +246,48 @@ class MycelioClient:
             status_code=fields.get(1, (None, 0))[1],
             body=fields.get(2, (None, b""))[1],
             content_type=fields.get(3, (None, ""))[1],
+        )
+
+    async def fetch(
+        self,
+        url: str,
+        *,
+        max_bytes: int | None = None,
+    ) -> FetchResponse:
+        """Get agent-friendly content for any URL.
+
+        Today: the daemon scrapes + extracts (`source="heuristic"`,
+        `signed=False`). The day the host ships a signed manifest, the
+        same call returns `source="manifest"`, `signed=True` — the
+        agent's code doesn't change.
+
+        Example:
+            page = await cli.fetch("https://stripe.com/pricing")
+            print(page.content)   # clean Markdown
+        """
+        req_fields: dict[int, tuple[TypeCode, Any]] = {
+            1: (TypeCode.STRING, url),
+        }
+        if max_bytes is not None:
+            req_fields[2] = (TypeCode.U32, max_bytes)
+        response = await self._request(Verb.FETCH, encode_payload(req_fields))
+        fields = decode_payload(response.payload) if response.payload else {}
+
+        affordances_field = fields.get(4)
+        affordances: list[dict[str, Any]] = []
+        if affordances_field is not None:
+            for sub_type, entry in affordances_field[1]:
+                if sub_type != TypeCode.MAP:
+                    continue
+                affordances.append({fid: cell[1] for fid, cell in entry.items()})
+
+        return FetchResponse(
+            source=fields.get(1, (None, "heuristic"))[1],
+            signed=fields.get(2, (None, False))[1],
+            content=fields.get(3, (None, ""))[1],
+            affordances=affordances,
+            fetched_at=fields.get(5, (None, 0))[1],
+            ttl_seconds=fields.get(6, (None, 0))[1],
         )
 
     # ------------------------------------------------------------------

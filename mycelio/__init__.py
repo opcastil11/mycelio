@@ -3,7 +3,14 @@
 See README.md and spec/protocol-v0.md for the protocol definition.
 """
 
-from mycelio.client import ClientError, DiscoverEntry, DiscoverResponse, MycelioClient, RouteResponse
+from mycelio.client import (
+    ClientError,
+    DiscoverEntry,
+    DiscoverResponse,
+    FetchResponse,
+    MycelioClient,
+    RouteResponse,
+)
 from mycelio.crypto import (
     SignatureError,
     generate_keypair,
@@ -27,6 +34,7 @@ __all__ = [
     "ClientError",
     "DiscoverEntry",
     "DiscoverResponse",
+    "FetchResponse",
     "Frame",
     "FrameError",
     "MycelioClient",

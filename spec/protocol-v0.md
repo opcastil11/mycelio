@@ -222,6 +222,48 @@ Submit an x402 payment proof. Mirrors `X-Payment-Proof` header but in-protocol.
 Used by peer relay nodes. Request a directory shard (compressed list
 of signed service entries). Returns one shard per response frame.
 
+### `FETCH` (0x09)
+
+Get agent-friendly content for any URL. Two paths share the same
+response shape:
+
+- **Heuristic** — host has no manifest. The daemon fetches the URL,
+  extracts the main content, and returns it. `source = "heuristic"`,
+  `signed = false` (the *envelope* is still SIG-signed, but the daemon
+  isn't vouching for the content's correctness).
+- **Manifest** — host ships a signed Mycelio manifest. The daemon
+  returns the manifest payload directly. `source = "manifest"`,
+  `signed = true`.
+
+Request:
+
+| Field ID | Name | Type | Notes |
+|---|---|---|---|
+| 1 | `url` | `string` | Absolute URL. Required. |
+| 2 | `max_bytes` | `u32` | Response cap. Default 262144 (256 KiB). |
+| 3 | `affordances` | `bool` | Whether to include parsed affordances. Default `true`. P2+ only — ignored in P1. |
+
+Response:
+
+| Field ID | Name | Type | Notes |
+|---|---|---|---|
+| 1 | `source` | `string` | `"manifest"` \| `"heuristic"`. |
+| 2 | `signed` | `bool` | True only when `source == "manifest"`. |
+| 3 | `content` | `string` | Extracted Markdown. |
+| 4 | `affordances` | `array<map>` | Inferred links / forms. Each map: `{kind, target, label}`. Empty in P1. |
+| 5 | `fetched_at` | `u64` | Unix seconds. |
+| 6 | `ttl_seconds` | `u32` | How long the daemon's cache will keep this entry. |
+
+Error codes (set on field `0xFF`):
+
+| Code | Meaning |
+|---|---|
+| `bad_url` | URL is malformed or not absolute. |
+| `robots_blocked` | Target's `robots.txt` disallows fetching. |
+| `fetch_failed` | Network or HTTP-level failure reaching the URL. |
+| `extraction_empty` | The URL responded but no main content could be extracted. |
+| `too_large` | Response exceeded `max_bytes`. |
+
 ### `SIG` (0xFE)
 
 Signature frame. Closes a server-side response stream. See [Signing](#signing).
