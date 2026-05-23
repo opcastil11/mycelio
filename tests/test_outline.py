@@ -111,29 +111,52 @@ def test_find_section():
 
 
 @pytest.fixture(autouse=True)
-def _reset_env():
-    saved = {k: os.environ.get(k) for k in
-             ("MYCD_OUTLINE_LLM_PROVIDER", "ANTHROPIC_API_KEY", "MYCD_OUTLINE_LLM_MODEL")}
+def _reset_env(monkeypatch):
+    # Clear all provider-related vars so tests start from a clean slate.
+    for k in (
+        "MYCD_OUTLINE_LLM_PROVIDER",
+        "MYCD_OUTLINE_LLM_MODEL",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+    ):
+        monkeypatch.delenv(k, raising=False)
+    # Pretend the claude CLI isn't installed by default so auto-resolution
+    # is deterministic across dev machines. Individual tests opt in.
+    monkeypatch.setattr("mycd.outline.shutil.which", lambda _name: None)
     yield
-    for k, v in saved.items():
-        if v is None:
-            os.environ.pop(k, None)
-        else:
-            os.environ[k] = v
 
 
-def test_llm_outline_disabled_by_default():
-    os.environ.pop("MYCD_OUTLINE_LLM_PROVIDER", None)
-    os.environ.pop("ANTHROPIC_API_KEY", None)
+def test_llm_outline_disabled_with_no_provider_no_key():
     assert llm_outline_enabled() is False
 
 
-def test_llm_outline_enabled_requires_both():
+def test_llm_outline_enabled_anthropic_explicit():
     os.environ["MYCD_OUTLINE_LLM_PROVIDER"] = "anthropic"
-    os.environ.pop("ANTHROPIC_API_KEY", None)
-    assert llm_outline_enabled() is False
+    assert llm_outline_enabled() is False  # provider set but no key
     os.environ["ANTHROPIC_API_KEY"] = "sk-test"
     assert llm_outline_enabled() is True
+
+
+def test_llm_outline_enabled_openai_explicit():
+    os.environ["MYCD_OUTLINE_LLM_PROVIDER"] = "openai"
+    os.environ["OPENAI_API_KEY"] = "sk-test"
+    assert llm_outline_enabled() is True
+
+
+def test_llm_outline_auto_picks_openai_first():
+    """OPENAI is preferred over ANTHROPIC when both keys are set in auto mode."""
+    from mycd.outline import _resolve_provider
+    os.environ["MYCD_OUTLINE_LLM_PROVIDER"] = "auto"
+    os.environ["OPENAI_API_KEY"] = "sk-openai"
+    os.environ["ANTHROPIC_API_KEY"] = "sk-anthropic"
+    assert _resolve_provider() == "openai"
+
+
+def test_llm_outline_auto_falls_through_to_anthropic():
+    from mycd.outline import _resolve_provider
+    # No provider set → auto mode by default
+    os.environ["ANTHROPIC_API_KEY"] = "sk-anthropic"
+    assert _resolve_provider() == "anthropic"
 
 
 def _mock_anthropic(handler):
@@ -141,12 +164,12 @@ def _mock_anthropic(handler):
 
 
 @pytest.mark.asyncio
-async def test_llm_sections_happy_path():
+async def test_llm_sections_anthropic_happy_path():
     os.environ["MYCD_OUTLINE_LLM_PROVIDER"] = "anthropic"
     os.environ["ANTHROPIC_API_KEY"] = "sk-test"
 
     def handler(request):
-        assert request.url.path == "/v1/messages"
+        assert "anthropic.com" in str(request.url)
         return httpx.Response(200, json={
             "content": [{
                 "type": "text",
@@ -160,6 +183,43 @@ async def test_llm_sections_happy_path():
         assert [s.id for s in secs] == ["intro", "auth"]
         assert secs[1].heading == "Auth"
         assert secs[1].depth == 2
+
+
+@pytest.mark.asyncio
+async def test_llm_sections_openai_happy_path():
+    """OpenAI returns JSON wrapped under {sections: [...]} because of
+    response_format=json_object; ensure we unwrap."""
+    os.environ["MYCD_OUTLINE_LLM_PROVIDER"] = "openai"
+    os.environ["OPENAI_API_KEY"] = "sk-openai"
+
+    def handler(request):
+        assert "openai.com" in str(request.url)
+        return httpx.Response(200, json={
+            "choices": [{
+                "message": {
+                    "content": '{"sections": [{"id":"a","heading":"A","depth":1,"preview":"first"}]}'
+                }
+            }]
+        })
+
+    async with _mock_anthropic(handler) as cli:
+        secs = await llm_sections("first chunk.", http_client=cli)
+        assert len(secs) == 1
+        assert secs[0].id == "a"
+        assert secs[0].preview == "first"
+
+
+@pytest.mark.asyncio
+async def test_llm_sections_openai_surfaces_5xx():
+    os.environ["MYCD_OUTLINE_LLM_PROVIDER"] = "openai"
+    os.environ["OPENAI_API_KEY"] = "sk-openai"
+
+    def handler(request):
+        return httpx.Response(500, text="rate-limited or whatever")
+
+    async with _mock_anthropic(handler) as cli:
+        with pytest.raises(LLMOutlineError, match="500"):
+            await llm_sections("text", http_client=cli)
 
 
 @pytest.mark.asyncio

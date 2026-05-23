@@ -443,9 +443,15 @@ async def test_fetch_llm_outline_unavailable_when_unconfigured():
     web.route("https://acme.com/pricing", httpx.Response(200, html=SAMPLE_HTML))
     server, dir_pub, port = _make_server(web)
 
-    # Make sure env doesn't accidentally enable LLM
+    # Make sure env doesn't accidentally enable any LLM provider.
     import os
-    saved = {k: os.environ.pop(k, None) for k in ("MYCD_OUTLINE_LLM_PROVIDER", "ANTHROPIC_API_KEY")}
+    saved = {k: os.environ.pop(k, None) for k in (
+        "MYCD_OUTLINE_LLM_PROVIDER", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+    )}
+    # Also block the claude-cli auto-discovery path.
+    import shutil as _shutil
+    _real_which = _shutil.which
+    _shutil.which = lambda _name: None
     try:
         async with anyio.create_task_group() as tg:
             tg.start_soon(server.serve, "127.0.0.1", port)
@@ -458,6 +464,7 @@ async def test_fetch_llm_outline_unavailable_when_unconfigured():
         for k, v in saved.items():
             if v is not None:
                 os.environ[k] = v
+        _shutil.which = _real_which
 
 
 @pytest.mark.asyncio

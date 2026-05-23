@@ -15,10 +15,12 @@ holds them next to the full Markdown so subsequent ``outline_only`` and
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import re
+import shutil
 from dataclasses import dataclass, field
 
 import httpx
@@ -32,6 +34,10 @@ SLUG_MAX_LEN = 60
 PREVIEW_MAX_LEN = 120
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_DEFAULT_MODEL = "claude-haiku-4-5-20251001"
+OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
+OPENAI_DEFAULT_MODEL = "gpt-4o-mini"
+CLAUDE_CLI_DEFAULT_MODEL = "claude-haiku-4-5"
+CLAUDE_CLI_TIMEOUT = 60.0
 LLM_MAX_CHARS = 24_000  # cap content sent to the LLM
 
 
@@ -165,12 +171,36 @@ Page content (may be truncated):
 Return the JSON array only, no explanation."""
 
 
+_PROVIDER_AUTO_ORDER = ("openai", "anthropic", "claude_cli")
+
+
+def _resolve_provider() -> str:
+    """Pick a provider per MYCD_OUTLINE_LLM_PROVIDER env. ``"auto"`` (or empty)
+    walks ``openai → anthropic → claude_cli`` and returns the first available.
+    Returns an empty string when nothing's available."""
+    explicit = os.environ.get("MYCD_OUTLINE_LLM_PROVIDER", "").lower().strip()
+    if explicit and explicit != "auto":
+        return explicit
+    for p in _PROVIDER_AUTO_ORDER:
+        if _provider_available(p):
+            return p
+    return ""
+
+
+def _provider_available(name: str) -> bool:
+    if name == "openai":
+        return bool(os.environ.get("OPENAI_API_KEY"))
+    if name == "anthropic":
+        return bool(os.environ.get("ANTHROPIC_API_KEY"))
+    if name == "claude_cli":
+        return shutil.which("claude") is not None
+    return False
+
+
 def llm_outline_enabled() -> bool:
-    """True iff env is configured for the LLM outline path."""
-    return (
-        os.environ.get("MYCD_OUTLINE_LLM_PROVIDER", "").lower() == "anthropic"
-        and bool(os.environ.get("ANTHROPIC_API_KEY"))
-    )
+    """True iff at least one provider is configured and usable."""
+    provider = _resolve_provider()
+    return bool(provider) and _provider_available(provider)
 
 
 async def llm_sections(
@@ -179,24 +209,58 @@ async def llm_sections(
     http_client: httpx.AsyncClient,
     model: str | None = None,
 ) -> list[Section]:
-    """Call Claude haiku to produce a semantic outline of ``markdown``.
+    """Call the configured LLM to produce a semantic outline of ``markdown``.
 
-    Returns ``Section`` objects whose ``content`` is empty — the LLM
-    provides structure (id/heading/depth/preview), the daemon binds
-    actual content by matching preview substrings against the full
-    Markdown so an agent asking for a ``section_id`` gets real text.
-    Raises :class:`LLMOutlineError` on failure; the caller decides
-    whether to fall back to structural.
+    Provider is picked by :func:`_resolve_provider`. Returns ``Section``
+    objects whose ``content`` is empty — the LLM provides structure
+    (id/heading/depth/preview), the daemon binds actual content by
+    matching preview substrings against the full Markdown so an agent
+    asking for a ``section_id`` gets real text. Raises
+    :class:`LLMOutlineError` on failure; the caller decides whether to
+    fall back to structural.
     """
-    if not llm_outline_enabled():
-        raise LLMOutlineError("llm outline not configured")
     if not markdown.strip():
         return []
+    provider = _resolve_provider()
+    if not provider or not _provider_available(provider):
+        raise LLMOutlineError("llm outline not configured")
 
+    user_msg = _LLM_USER_TEMPLATE.format(content=markdown[:LLM_MAX_CHARS])
+    if provider == "openai":
+        text = await _call_openai(user_msg, http_client=http_client, model=model)
+    elif provider == "anthropic":
+        text = await _call_anthropic(user_msg, http_client=http_client, model=model)
+    elif provider == "claude_cli":
+        text = await _call_claude_cli(user_msg, model=model)
+    else:
+        raise LLMOutlineError(f"unknown llm provider: {provider!r}")
+
+    parsed = _parse_llm_json(text)
+    sections: list[Section] = []
+    used: dict[str, int] = {}
+    for entry in parsed:
+        if not isinstance(entry, dict):
+            continue
+        heading = str(entry.get("heading", "")).strip()
+        if not heading:
+            continue
+        depth = max(1, min(3, int(entry.get("depth", 1) or 1)))
+        preview = str(entry.get("preview", "")).strip()
+        sid = _unique_slug(_slugify(str(entry.get("id") or heading)), used)
+        sections.append(Section(id=sid, heading=heading, depth=depth, content="", preview=preview))
+    return sections
+
+
+# ---------------------------------------------------------------------------
+# Provider implementations
+# ---------------------------------------------------------------------------
+
+
+async def _call_anthropic(
+    user_msg: str, *, http_client: httpx.AsyncClient, model: str | None,
+) -> str:
     api_key = os.environ["ANTHROPIC_API_KEY"]
     model_id = model or os.environ.get("MYCD_OUTLINE_LLM_MODEL", ANTHROPIC_DEFAULT_MODEL)
-    user_msg = _LLM_USER_TEMPLATE.format(content=markdown[:LLM_MAX_CHARS])
-
     try:
         r = await http_client.post(
             ANTHROPIC_API_URL,
@@ -217,27 +281,99 @@ async def llm_sections(
         raise LLMOutlineError(f"anthropic call failed: {exc}") from exc
     if r.status_code >= 400:
         raise LLMOutlineError(f"anthropic returned HTTP {r.status_code}: {r.text[:200]}")
-
     try:
-        body = r.json()
-        text = body["content"][0]["text"]
+        return r.json()["content"][0]["text"]
     except (KeyError, IndexError, ValueError) as exc:
         raise LLMOutlineError(f"unexpected anthropic response: {exc}") from exc
 
-    parsed = _parse_llm_json(text)
-    sections: list[Section] = []
-    used: dict[str, int] = {}
-    for entry in parsed:
-        if not isinstance(entry, dict):
-            continue
-        heading = str(entry.get("heading", "")).strip()
-        if not heading:
-            continue
-        depth = max(1, min(3, int(entry.get("depth", 1) or 1)))
-        preview = str(entry.get("preview", "")).strip()
-        sid = _unique_slug(_slugify(str(entry.get("id") or heading)), used)
-        sections.append(Section(id=sid, heading=heading, depth=depth, content="", preview=preview))
-    return sections
+
+async def _call_openai(
+    user_msg: str, *, http_client: httpx.AsyncClient, model: str | None,
+) -> str:
+    """OpenAI Chat Completions with strict JSON mode. We wrap the array in
+    a top-level object key because ``response_format=json_object`` requires
+    an object, not an array."""
+    api_key = os.environ["OPENAI_API_KEY"]
+    model_id = model or os.environ.get("MYCD_OUTLINE_LLM_MODEL", OPENAI_DEFAULT_MODEL)
+    system = _LLM_SYSTEM_PROMPT + ' Wrap the array under {"sections": [...]}.'
+    try:
+        r = await http_client.post(
+            OPENAI_API_URL,
+            headers={
+                "authorization": f"Bearer {api_key}",
+                "content-type": "application/json",
+            },
+            json={
+                "model": model_id,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_msg},
+                ],
+                "response_format": {"type": "json_object"},
+                "max_tokens": 2048,
+            },
+            timeout=30.0,
+        )
+    except httpx.HTTPError as exc:
+        raise LLMOutlineError(f"openai call failed: {exc}") from exc
+    if r.status_code >= 400:
+        raise LLMOutlineError(f"openai returned HTTP {r.status_code}: {r.text[:200]}")
+    try:
+        text = r.json()["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, ValueError) as exc:
+        raise LLMOutlineError(f"unexpected openai response: {exc}") from exc
+    # Strip the wrapper object — _parse_llm_json expects an array.
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict) and "sections" in obj:
+            return json.dumps(obj["sections"])
+    except json.JSONDecodeError:
+        pass
+    return text
+
+
+async def _call_claude_cli(user_msg: str, *, model: str | None) -> str:
+    """Subprocess fallback: ``claude -p <prompt> --print --output-format json``.
+    Returns the LLM's text content. Useful when no API keys are set but the
+    Claude CLI binary is reachable (e.g. mounted into the container)."""
+    binary = shutil.which("claude") or "claude"
+    model_id = model or os.environ.get("MYCD_OUTLINE_LLM_MODEL", CLAUDE_CLI_DEFAULT_MODEL)
+    args = [
+        binary,
+        "-p", user_msg,
+        "--print",
+        "--output-format", "json",
+        "--model", model_id,
+        "--system-prompt", _LLM_SYSTEM_PROMPT,
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=CLAUDE_CLI_TIMEOUT)
+    except asyncio.TimeoutError as exc:
+        raise LLMOutlineError(f"claude cli timed out after {CLAUDE_CLI_TIMEOUT}s") from exc
+    except (OSError, FileNotFoundError) as exc:
+        raise LLMOutlineError(f"claude cli not runnable: {exc}") from exc
+    if proc.returncode != 0:
+        raise LLMOutlineError(
+            f"claude cli exit {proc.returncode}: {stderr.decode('utf-8', 'replace')[:200]}"
+        )
+    raw = stdout.decode("utf-8", "replace").strip()
+    if not raw:
+        raise LLMOutlineError("claude cli returned empty stdout")
+    # `--output-format json` wraps the response in an object like
+    # {"type": "result", "result": "<llm text>", ...}. Pull `.result`.
+    try:
+        envelope = json.loads(raw)
+        if isinstance(envelope, dict) and "result" in envelope:
+            return str(envelope["result"])
+    except json.JSONDecodeError:
+        pass
+    return raw
 
 
 def _parse_llm_json(text: str) -> list:
