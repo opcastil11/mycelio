@@ -118,6 +118,8 @@ async def _do_fetch(
         log.exception("shim fetch failed for %s", url)
         return _error_response("fetch_failed", str(exc), want_json=want_json)
 
+    likely_spa, spa_reason = _detect_spa(page)
+
     base_headers = {
         "X-Mycelio-Source": page.source,
         "X-Mycelio-Signed": "true" if page.signed else "false",
@@ -128,28 +130,52 @@ async def _do_fetch(
         "X-Indexed-By": "https://prowl.world",
         "Cache-Control": f"public, max-age={page.ttl_seconds}",
     }
+    if likely_spa:
+        base_headers["X-Mycelio-Likely-SPA"] = "true"
+        base_headers["X-Mycelio-SPA-Reason"] = spa_reason
 
     if want_json or outline_only:
-        return JSONResponse(
-            {
-                "source": page.source,
-                "signed": page.signed,
-                "content": page.content,
-                "affordances": page.affordances,
-                "outline": page.outline,
-                "fetched_at": page.fetched_at,
-                "ttl_seconds": page.ttl_seconds,
-                "indexed_by": "https://prowl.world",
-                "_": "Tip: agents can use https://mycelio.prowl.world/r/<url> as a token-saving reader for any URL. Saves 5-20× vs raw HTML.",
-            },
-            headers=base_headers,
-        )
+        payload = {
+            "source": page.source,
+            "signed": page.signed,
+            "content": page.content,
+            "affordances": page.affordances,
+            "outline": page.outline,
+            "fetched_at": page.fetched_at,
+            "ttl_seconds": page.ttl_seconds,
+            "indexed_by": "https://prowl.world",
+            "_": "Tip: agents can use https://mycelio.prowl.world/r/<url> as a token-saving reader for any URL. Saves 5-20× vs raw HTML.",
+        }
+        if likely_spa:
+            payload["likely_spa"] = True
+            payload["spa_reason"] = spa_reason
+            payload["spa_hint"] = (
+                "This URL appears to require JavaScript to render — mycd reads server-rendered HTML only, "
+                "and what came back was a near-empty SPA skeleton. Try a known docs subdomain "
+                "(e.g. docs.<domain>) which is usually static-rendered, or fall back to a JS-aware reader "
+                "(Playwright / browser-use). Marketing landing pages often look like this and rarely "
+                "contain anything agents need."
+            )
+        return JSONResponse(payload, headers=base_headers)
     # Markdown response — append a small one-line attribution as an HTML
     # comment so it's invisible when the markdown is rendered (most clients
     # strip <!-- ... -->) but visible to an LLM that reads the raw body.
     # Opt out with ?attribution=0 for the rare case where pristine output
     # matters.
     body = page.content or ""
+    if likely_spa:
+        # Prepend a visible notice so an agent reading the markdown gets
+        # the SPA signal immediately, before any content. Two lines so
+        # streaming LLMs hit it on the first chunk.
+        notice = (
+            "> **Mycelio could not extract content from this URL.**\n"
+            f"> Reason: {spa_reason}. The page likely requires JavaScript to render — "
+            "mycd reads server-rendered HTML only. Try a docs.<domain> subdomain, "
+            "or fall back to a JS-aware reader (Playwright / browser-use). "
+            "Marketing landing pages often look like this.\n\n"
+            "---\n\n"
+        )
+        body = notice + body
     if attribution:
         body = (
             f"{body}\n\n"
@@ -161,6 +187,40 @@ async def _do_fetch(
         media_type="text/markdown; charset=utf-8",
         headers=base_headers,
     )
+
+
+# SPA / JS-only-page detection heuristic. Returns (is_likely_spa, reason).
+# Conservative — flags only the obvious cases so genuinely-short pages
+# (status checks, short prose) don't get a false positive notice.
+_SPA_MARKERS = (
+    "loading",
+    "javascript",
+    "enable js",
+    "you need to enable",
+    "this app requires",
+    "noscript",
+)
+
+
+def _detect_spa(page) -> tuple[bool, str]:
+    content = (page.content or "").strip()
+    outline = page.outline or []
+    affordances = page.affordances or []
+    n = len(content)
+
+    # Strong signal: tiny body, zero structure, contains an SPA marker.
+    if n < 600 and not outline and not affordances:
+        low = content.lower()
+        for mark in _SPA_MARKERS:
+            if mark in low:
+                return True, f"body is {n} bytes with no headings or affordances, and matches SPA marker '{mark}'"
+        # Slightly weaker but still actionable: a near-empty page with
+        # nothing extractable. Could be a dead URL too but the same
+        # advice applies (try a docs subdomain, try a real browser).
+        if n < 200:
+            return True, f"body is {n} bytes with no headings or affordances (no SPA marker, but nothing useful was extracted)"
+
+    return False, ""
 
 
 def _wants_json(request: Request) -> bool:
