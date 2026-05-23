@@ -34,6 +34,14 @@ from mycd.extractor import (
     ExtractorError,
     fetch_and_extract,
 )
+from mycd.outline import (
+    LLMOutlineError,
+    Section,
+    bind_llm_content,
+    find_section,
+    llm_outline_enabled,
+    llm_sections,
+)
 from mycelio.crypto import sign_chain
 from mycelio.frame import HEADER_LEN, MAX_PAYLOAD, Frame, FrameError, decode_frame, encode_frame
 from mycelio.manifest import (
@@ -377,15 +385,18 @@ class MycdServer:
         await self._send_signed(stream, [response])
 
     async def _handle_fetch(self, stream: SocketStream, frame: Frame) -> None:
-        """Heuristic content extraction for any URL. P1: trafilatura + Jina fallback.
+        """Heuristic content extraction for any URL.
 
         Request fields:
-          1 url        : string (required)
-          2 max_bytes  : u32 (optional, default 256 KiB)
-          3 affordances: bool (optional, ignored in P1)
+          1 url           : string (required)
+          2 max_bytes     : u32 (optional, default 256 KiB)
+          3 affordances   : bool (optional; reserved)
+          7 outline_only  : bool (optional)
+          8 section_id    : string (optional — return just that section)
+          9 outline_mode  : string (optional — "structural" | "llm", default "structural")
 
         Response: {1: source, 2: signed, 3: content, 4: affordances,
-                   5: fetched_at, 6: ttl_seconds}.
+                   5: fetched_at, 6: ttl_seconds, 7: outline}.
         """
         try:
             req = decode_payload(frame.payload) if frame.payload else {}
@@ -400,58 +411,106 @@ class MycdServer:
 
         mb_field = req.get(2)
         max_bytes = mb_field[1] if mb_field and mb_field[1] > 0 else DEFAULT_MAX_BYTES
+        outline_only = bool(req.get(7, (None, False))[1])
+        section_id = req.get(8, (None, None))[1] or None
+        outline_mode = (req.get(9, (None, "structural"))[1] or "structural").lower()
+        if outline_mode not in ("structural", "llm"):
+            await self._send_error(
+                stream, frame, code="bad_payload",
+                msg=f"unknown outline_mode {outline_mode!r}",
+            )
+            return
 
+        # Resolve the underlying extraction (cache → manifest → fetch).
         now = int(time.time())
+        source = "heuristic"
+        signed = False
+        ttl_remaining = self._fetch_ttl_seconds
+        extracted: ExtractedContent | None = None
+
         cached = self._fetch_cache.get(url)
         if cached is not None:
-            extracted, expires_at = cached
+            cached_extracted, expires_at = cached
             if expires_at > now:
-                await self._send_fetch_response(
-                    stream, frame, extracted,
-                    source="heuristic", signed=False,
-                    ttl_seconds=expires_at - now,
+                extracted = cached_extracted
+                ttl_remaining = expires_at - now
+            else:
+                self._fetch_cache.pop(url, None)
+
+        if extracted is None:
+            target_host = (urlparse(url).hostname or "").lower()
+            manifest = self.manifests_by_host.get(target_host)
+            if manifest is not None:
+                extracted = _build_manifest_extracted(manifest, url, now)
+                source = "manifest"
+                signed = True
+            else:
+                try:
+                    extracted = await fetch_and_extract(
+                        url,
+                        http_client=self._http_client,
+                        max_bytes=max_bytes,
+                        respect_robots=self._respect_robots,
+                        robots_cache=self._robots_cache,
+                        jina_fallback=self._jina_fallback,
+                    )
+                except ExtractorError as exc:
+                    await self._send_error(stream, frame, code=exc.code, msg=exc.message)
+                    return
+                expires_at = now + self._fetch_ttl_seconds
+                if len(self._fetch_cache) >= FETCH_CACHE_MAX:
+                    self._fetch_cache.pop(next(iter(self._fetch_cache)))
+                self._fetch_cache[url] = (extracted, expires_at)
+                log.debug("fetch %s via %s (%d chars)", url, extracted.engine, len(extracted.content))
+
+        # Lazily compute LLM outline (cached on the extracted entry).
+        if outline_mode == "llm" and extracted.llm_sections is None:
+            if not llm_outline_enabled():
+                await self._send_error(
+                    stream, frame, code="llm_unavailable",
+                    msg="MYCD_OUTLINE_LLM_PROVIDER / ANTHROPIC_API_KEY not configured",
                 )
                 return
-            self._fetch_cache.pop(url, None)
+            try:
+                raw = await llm_sections(extracted.content, http_client=self._http_client)
+                extracted.llm_sections = bind_llm_content(raw, extracted.content)
+            except LLMOutlineError as exc:
+                log.warning("llm outline failed for %s: %s", url, exc)
+                await self._send_error(stream, frame, code="llm_failed", msg=str(exc))
+                return
 
-        # P3 — manifest graduation. If the host ships a signed manifest,
-        # return that instead of scraping. Same response shape, agent
-        # code doesn't change; affordances now carry typed ops.
-        target_host = (urlparse(url).hostname or "").lower()
-        manifest = self.manifests_by_host.get(target_host)
-        if manifest is not None:
-            extracted = _build_manifest_extracted(manifest, url, now)
-            await self._send_fetch_response(
-                stream, frame, extracted,
-                source="manifest", signed=True,
-                ttl_seconds=self._fetch_ttl_seconds,
-            )
-            return
+        sections = (
+            extracted.llm_sections
+            if outline_mode == "llm" and extracted.llm_sections is not None
+            else extracted.sections
+        )
 
-        try:
-            extracted = await fetch_and_extract(
-                url,
-                http_client=self._http_client,
-                max_bytes=max_bytes,
-                respect_robots=self._respect_robots,
-                robots_cache=self._robots_cache,
-                jina_fallback=self._jina_fallback,
-            )
-        except ExtractorError as exc:
-            await self._send_error(stream, frame, code=exc.code, msg=exc.message)
-            return
+        if section_id:
+            picked = find_section(sections, section_id)
+            if picked is None:
+                await self._send_error(
+                    stream, frame, code="section_not_found",
+                    msg=f"no section with id {section_id!r}",
+                )
+                return
+            content_out = picked.content
+            affordances_out: list[dict] = []
+            outline_out: list[Section] = [picked]
+        elif outline_only:
+            content_out = ""
+            affordances_out = []
+            outline_out = sections
+        else:
+            content_out = extracted.content
+            affordances_out = extracted.affordances
+            outline_out = sections
 
-        expires_at = now + self._fetch_ttl_seconds
-        if len(self._fetch_cache) >= FETCH_CACHE_MAX:
-            # Evict the oldest entry (dict preserves insertion order).
-            self._fetch_cache.pop(next(iter(self._fetch_cache)))
-        self._fetch_cache[url] = (extracted, expires_at)
-
-        log.debug("fetch %s via %s (%d chars)", url, extracted.engine, len(extracted.content))
         await self._send_fetch_response(
             stream, frame, extracted,
-            source="heuristic", signed=False,
-            ttl_seconds=self._fetch_ttl_seconds,
+            source=source, signed=signed, ttl_seconds=ttl_remaining,
+            content_override=content_out,
+            affordances_override=affordances_out,
+            outline=outline_out,
         )
 
     async def _send_fetch_response(
@@ -463,18 +522,26 @@ class MycdServer:
         source: str,
         signed: bool,
         ttl_seconds: int,
+        content_override: str | None = None,
+        affordances_override: list[dict] | None = None,
+        outline: list[Section] | None = None,
     ) -> None:
-        affordances_array = [
-            _encode_affordance(aff) for aff in extracted.affordances
-        ]
+        content = content_override if content_override is not None else extracted.content
+        affordances = (
+            affordances_override if affordances_override is not None else extracted.affordances
+        )
+        affordances_array = [_encode_affordance(aff) for aff in affordances]
+        outline_array = [_encode_section(s) for s in (outline or [])]
+
         payload = encode_payload(
             {
                 1: (TypeCode.STRING, source),
                 2: (TypeCode.BOOL, signed),
-                3: (TypeCode.STRING, extracted.content),
+                3: (TypeCode.STRING, content),
                 4: (TypeCode.ARRAY, affordances_array),
                 5: (TypeCode.U64, extracted.fetched_at),
                 6: (TypeCode.U32, ttl_seconds),
+                7: (TypeCode.ARRAY, outline_array),
             }
         )
         response = Frame(
@@ -562,6 +629,22 @@ def _build_manifest_extracted(manifest: Manifest, url: str, now: int) -> Extract
         final_url=url,
         engine="manifest",
         affordances=affordances,
+    )
+
+
+def _encode_section(s: Section) -> tuple[TypeCode, dict]:
+    """Encode one outline entry. Wire fields:
+        1: id, 2: heading, 3: depth, 4: size_bytes, 5: preview
+    """
+    return (
+        TypeCode.MAP,
+        {
+            1: (TypeCode.STRING, s.id),
+            2: (TypeCode.STRING, s.heading),
+            3: (TypeCode.U8, s.depth),
+            4: (TypeCode.U32, s.size_bytes),
+            5: (TypeCode.STRING, s.preview),
+        },
     )
 
 

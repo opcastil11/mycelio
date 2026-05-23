@@ -84,6 +84,7 @@ class FetchResponse:
     affordances: list[dict[str, Any]] = field(default_factory=list)
     fetched_at: int = 0
     ttl_seconds: int = 0
+    outline: list[dict[str, Any]] = field(default_factory=list)
 
 
 class MycelioClient:
@@ -253,27 +254,40 @@ class MycelioClient:
         url: str,
         *,
         max_bytes: int | None = None,
+        outline_only: bool = False,
+        section_id: str | None = None,
+        outline_mode: str = "structural",
     ) -> FetchResponse:
         """Get agent-friendly content for any URL.
 
-        Today: the daemon scrapes + extracts (`source="heuristic"`,
-        `signed=False`). The day the host ships a signed manifest, the
-        same call returns `source="manifest"`, `signed=True` — the
-        agent's code doesn't change.
+        Modes:
+            ``outline_only=True``: fast index of sections; ``content`` is empty,
+                ``outline`` is populated.
+            ``section_id="..."``: returns just that section's text in
+                ``content``; ``outline`` is reduced to that one entry.
+            default: full content + outline + affordances.
 
-        Example:
-            page = await cli.fetch("https://stripe.com/pricing")
-            print(page.content)   # clean Markdown
+        ``outline_mode`` is ``"structural"`` (free, h1–h6) or ``"llm"`` (the
+        daemon calls a configured LLM to generate a semantic outline; requires
+        server-side env config or returns ``llm_unavailable``).
         """
         req_fields: dict[int, tuple[TypeCode, Any]] = {
             1: (TypeCode.STRING, url),
         }
         if max_bytes is not None:
             req_fields[2] = (TypeCode.U32, max_bytes)
+        if outline_only:
+            req_fields[7] = (TypeCode.BOOL, True)
+        if section_id is not None:
+            req_fields[8] = (TypeCode.STRING, section_id)
+        if outline_mode and outline_mode != "structural":
+            req_fields[9] = (TypeCode.STRING, outline_mode)
+
         response = await self._request(Verb.FETCH, encode_payload(req_fields))
         fields = decode_payload(response.payload) if response.payload else {}
 
         affordances = _parse_affordances_field(fields.get(4))
+        outline = _parse_outline_field(fields.get(7))
 
         return FetchResponse(
             source=fields.get(1, (None, "heuristic"))[1],
@@ -282,6 +296,7 @@ class MycelioClient:
             affordances=affordances,
             fetched_at=fields.get(5, (None, 0))[1],
             ttl_seconds=fields.get(6, (None, 0))[1],
+            outline=outline,
         )
 
     # ------------------------------------------------------------------
@@ -392,6 +407,26 @@ def _parse_affordances_field(field_cell) -> list[dict[str, Any]]:
             if hints:
                 aff["hints"] = hints
         out.append(aff)
+    return out
+
+
+def _parse_outline_field(field_cell) -> list[dict[str, Any]]:
+    """Decode the FETCH outline array (field 7) into named-key dicts:
+    each entry has keys ``id``, ``heading``, ``depth``, ``size_bytes``,
+    ``preview``."""
+    if field_cell is None:
+        return []
+    out: list[dict[str, Any]] = []
+    for sub_type, entry in field_cell[1]:
+        if sub_type != TypeCode.MAP:
+            continue
+        out.append({
+            "id": entry.get(1, (None, ""))[1],
+            "heading": entry.get(2, (None, ""))[1],
+            "depth": entry.get(3, (None, 0))[1],
+            "size_bytes": entry.get(4, (None, 0))[1],
+            "preview": entry.get(5, (None, ""))[1],
+        })
     return out
 
 

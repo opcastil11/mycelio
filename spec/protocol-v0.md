@@ -241,7 +241,10 @@ Request:
 |---|---|---|---|
 | 1 | `url` | `string` | Absolute URL. Required. |
 | 2 | `max_bytes` | `u32` | Response cap. Default 262144 (256 KiB). |
-| 3 | `affordances` | `bool` | Whether to include parsed affordances. Default `true`. P2+ only — ignored in P1. |
+| 3 | `affordances` | `bool` | Whether to include parsed affordances. Default `true`. |
+| 7 | `outline_only` | `bool` | If true, server returns the outline only — `content` is empty, `affordances` is empty. |
+| 8 | `section_id` | `string` | Return just the named section's content; outline is reduced to that one entry. |
+| 9 | `outline_mode` | `string` | `"structural"` (default) walks `<h1>`–`<h6>`; `"llm"` asks a configured LLM for a semantic outline. |
 
 Response:
 
@@ -249,10 +252,11 @@ Response:
 |---|---|---|---|
 | 1 | `source` | `string` | `"manifest"` \| `"heuristic"`. |
 | 2 | `signed` | `bool` | True only when `source == "manifest"`. |
-| 3 | `content` | `string` | Extracted Markdown. |
+| 3 | `content` | `string` | Extracted Markdown (empty when `outline_only=true`). |
 | 4 | `affordances` | `array<map>` | Inferred links / forms (heuristic) or manifest ops (manifest path). Each entry: `{1:kind, 2:target, 3:label, 4:hints?}`. Hint keys: `1:method, 2:fields[{1:name,2:type,3:required}], 3:path`. |
 | 5 | `fetched_at` | `u64` | Unix seconds. |
 | 6 | `ttl_seconds` | `u32` | How long the daemon's cache will keep this entry. |
+| 7 | `outline` | `array<map>` | Section index. Each entry: `{1:id, 2:heading, 3:depth, 4:size_bytes, 5:preview}`. |
 
 Error codes (set on field `0xFF`):
 
@@ -263,6 +267,9 @@ Error codes (set on field `0xFF`):
 | `fetch_failed` | Network or HTTP-level failure reaching the URL. |
 | `extraction_empty` | The URL responded but no main content could be extracted. |
 | `too_large` | Response exceeded `max_bytes`. |
+| `section_not_found` | `section_id` did not match any entry in the page's outline. |
+| `llm_unavailable` | `outline_mode=llm` requested but the daemon has no LLM provider configured. |
+| `llm_failed` | LLM call (network/parse) failed; caller may retry with `outline_mode=structural`. |
 
 ### `SIG` (0xFE)
 

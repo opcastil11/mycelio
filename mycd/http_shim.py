@@ -40,6 +40,9 @@ _ERROR_STATUS = {
     "extraction_empty": 502,
     "too_large": 413,
     "bad_payload": 400,
+    "section_not_found": 404,
+    "llm_unavailable": 501,
+    "llm_failed": 502,
 }
 
 
@@ -87,14 +90,26 @@ def _parse_error(exc: ClientError) -> tuple[str, str]:
     return "fetch_failed", msg
 
 
-async def _do_fetch(url: str, want_json: bool) -> Response:
+async def _do_fetch(
+    url: str,
+    *,
+    want_json: bool,
+    outline_only: bool,
+    section_id: str | None,
+    outline_mode: str,
+) -> Response:
     if not url or not url.startswith(("http://", "https://")):
         return _error_response(
             "bad_url", "url must start with http:// or https://", want_json=want_json
         )
     try:
         async with _client() as cli:
-            page = await cli.fetch(url)
+            page = await cli.fetch(
+                url,
+                outline_only=outline_only,
+                section_id=section_id,
+                outline_mode=outline_mode,
+            )
     except ClientError as exc:
         code, msg = _parse_error(exc)
         return _error_response(code, msg, want_json=want_json)
@@ -102,27 +117,33 @@ async def _do_fetch(url: str, want_json: bool) -> Response:
         log.exception("shim fetch failed for %s", url)
         return _error_response("fetch_failed", str(exc), want_json=want_json)
 
-    if want_json:
+    base_headers = {
+        "X-Mycelio-Source": page.source,
+        "X-Mycelio-Signed": "true" if page.signed else "false",
+        "X-Mycelio-TTL": str(page.ttl_seconds),
+        "X-Mycelio-Affordances": str(len(page.affordances)),
+        "X-Mycelio-Outline": str(len(page.outline)),
+        "X-Mycelio-Mode": outline_mode,
+        "Cache-Control": f"public, max-age={page.ttl_seconds}",
+    }
+
+    if want_json or outline_only:
         return JSONResponse(
             {
                 "source": page.source,
                 "signed": page.signed,
                 "content": page.content,
                 "affordances": page.affordances,
+                "outline": page.outline,
                 "fetched_at": page.fetched_at,
                 "ttl_seconds": page.ttl_seconds,
-            }
+            },
+            headers=base_headers,
         )
     return PlainTextResponse(
         page.content,
         media_type="text/markdown; charset=utf-8",
-        headers={
-            "X-Mycelio-Source": page.source,
-            "X-Mycelio-Signed": "true" if page.signed else "false",
-            "X-Mycelio-TTL": str(page.ttl_seconds),
-            "X-Mycelio-Affordances": str(len(page.affordances)),
-            "Cache-Control": f"public, max-age={page.ttl_seconds}",
-        },
+        headers=base_headers,
     )
 
 
@@ -132,19 +153,39 @@ def _wants_json(request: Request) -> bool:
     return "application/json" in accept or fmt == "json"
 
 
+def _opts(request: Request) -> tuple[bool, str | None, str]:
+    """Read ?outline=1, ?section=<id>, ?mode=structural|llm from the URL."""
+    q = request.query_params
+    outline_only = q.get("outline", "").lower() in ("1", "true", "yes")
+    section_id = q.get("section") or None
+    mode = (q.get("mode") or "structural").lower()
+    return outline_only, section_id, mode
+
+
 async def reader_prepend(request: Request) -> Response:
     """``GET /r/https://example.com`` — Jina-style prepend."""
     url = request.path_params["url"]
-    # Strip a leading slash and re-decode if Starlette already did it. We
-    # intentionally keep ``://`` in the path; Starlette's path param matcher
-    # uses ``path:`` to allow that.
-    return await _do_fetch(url, _wants_json(request))
+    outline_only, section_id, mode = _opts(request)
+    return await _do_fetch(
+        url,
+        want_json=_wants_json(request),
+        outline_only=outline_only,
+        section_id=section_id,
+        outline_mode=mode,
+    )
 
 
 async def reader_query(request: Request) -> Response:
     """``GET /r?url=...`` — query-param form, easier to share."""
     url = request.query_params.get("url", "")
-    return await _do_fetch(url, _wants_json(request))
+    outline_only, section_id, mode = _opts(request)
+    return await _do_fetch(
+        url,
+        want_json=_wants_json(request),
+        outline_only=outline_only,
+        section_id=section_id,
+        outline_mode=mode,
+    )
 
 
 async def healthz(_: Request) -> Response:

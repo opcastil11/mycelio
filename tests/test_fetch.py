@@ -349,6 +349,118 @@ async def test_fetch_graduates_to_manifest_when_host_registered():
 
 
 @pytest.mark.asyncio
+async def test_fetch_returns_structural_outline():
+    """Heuristic page with h1/h2/h3 produces an outline."""
+    web = MockWeb()
+    sectioned = b"""<!DOCTYPE html><html><body><article>
+<h1>Acme Docs</h1>
+<p>This is a guide to using the Acme API for processing payments at scale.</p>
+<h2>Auth</h2>
+<p>Use a bearer token in the Authorization header for every request you make.</p>
+<h2>Charges</h2>
+<p>Create a charge with POST to the charges endpoint to bill a customer.</p>
+</article></body></html>"""
+    web.route("https://acme.com/docs", httpx.Response(200, content=sectioned, headers={"content-type": "text/html"}))
+    server, dir_pub, port = _make_server(web)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(server.serve, "127.0.0.1", port)
+        await anyio.sleep(0.05)
+        async with MycelioClient.connect("127.0.0.1", port, root_pubkey=dir_pub) as cli:
+            page = await cli.fetch("https://acme.com/docs")
+            ids = [s["id"] for s in page.outline]
+            assert ids == ["acme-docs", "auth", "charges"]
+            assert all(s["size_bytes"] > 0 for s in page.outline[1:])
+            assert page.outline[1]["heading"] == "Auth"
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_fetch_outline_only_omits_content():
+    web = MockWeb()
+    sectioned = b"""<html><body>
+<h1>Top</h1><p>intro paragraph long enough for trafilatura</p>
+<h2>Sub</h2><p>second paragraph long enough for trafilatura</p>
+</body></html>"""
+    web.route("https://acme.com/", httpx.Response(200, content=sectioned, headers={"content-type": "text/html"}))
+    server, dir_pub, port = _make_server(web)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(server.serve, "127.0.0.1", port)
+        await anyio.sleep(0.05)
+        async with MycelioClient.connect("127.0.0.1", port, root_pubkey=dir_pub) as cli:
+            page = await cli.fetch("https://acme.com/", outline_only=True)
+            assert page.content == ""
+            assert page.affordances == []
+            assert len(page.outline) >= 1
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_fetch_section_id_narrows_to_one_section():
+    web = MockWeb()
+    sectioned = b"""<html><body><article>
+<h1>Acme</h1>
+<p>A long enough intro paragraph for trafilatura to keep around.</p>
+<h2>Pricing</h2>
+<p>Our pricing tiers start at nineteen dollars per month for solo developers.</p>
+<h2>Support</h2>
+<p>Email us at support@acme.example for help with your account or billing.</p>
+</article></body></html>"""
+    web.route("https://acme.com/", httpx.Response(200, content=sectioned, headers={"content-type": "text/html"}))
+    server, dir_pub, port = _make_server(web)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(server.serve, "127.0.0.1", port)
+        await anyio.sleep(0.05)
+        async with MycelioClient.connect("127.0.0.1", port, root_pubkey=dir_pub) as cli:
+            page = await cli.fetch("https://acme.com/", section_id="pricing")
+            assert "pricing tiers" in page.content
+            assert "support@acme" not in page.content
+            assert len(page.outline) == 1
+            assert page.outline[0]["id"] == "pricing"
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_fetch_unknown_section_id_errors():
+    web = MockWeb()
+    web.route("https://acme.com/pricing", httpx.Response(200, html=SAMPLE_HTML))
+    server, dir_pub, port = _make_server(web)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(server.serve, "127.0.0.1", port)
+        await anyio.sleep(0.05)
+        async with MycelioClient.connect("127.0.0.1", port, root_pubkey=dir_pub) as cli:
+            with pytest.raises(ClientError, match="section_not_found"):
+                await cli.fetch("https://acme.com/pricing", section_id="does-not-exist")
+        tg.cancel_scope.cancel()
+
+
+@pytest.mark.asyncio
+async def test_fetch_llm_outline_unavailable_when_unconfigured():
+    web = MockWeb()
+    web.route("https://acme.com/pricing", httpx.Response(200, html=SAMPLE_HTML))
+    server, dir_pub, port = _make_server(web)
+
+    # Make sure env doesn't accidentally enable LLM
+    import os
+    saved = {k: os.environ.pop(k, None) for k in ("MYCD_OUTLINE_LLM_PROVIDER", "ANTHROPIC_API_KEY")}
+    try:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(server.serve, "127.0.0.1", port)
+            await anyio.sleep(0.05)
+            async with MycelioClient.connect("127.0.0.1", port, root_pubkey=dir_pub) as cli:
+                with pytest.raises(ClientError, match="llm_unavailable"):
+                    await cli.fetch("https://acme.com/pricing", outline_mode="llm")
+            tg.cancel_scope.cancel()
+    finally:
+        for k, v in saved.items():
+            if v is not None:
+                os.environ[k] = v
+
+
+@pytest.mark.asyncio
 async def test_fetch_disables_jina_when_flag_off():
     """When jina_fallback=False, trafilatura-empty raises extraction_empty."""
     web = MockWeb()

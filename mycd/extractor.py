@@ -23,6 +23,7 @@ import httpx
 import trafilatura
 
 from mycd.affordances import parse_affordances
+from mycd.outline import Section, structural_sections
 
 DEFAULT_MAX_BYTES = 256 * 1024
 DEFAULT_USER_AGENT = "MycelioFetch/0 (+https://mycelio.prowl.world)"
@@ -36,13 +37,17 @@ JINA_READER_BASE = "https://r.jina.ai"
 class ExtractedContent:
     """A successful extraction. `final_url` reflects any redirects.
     `engine` is which path succeeded — informational, not on the wire.
-    `affordances` is empty on the Jina path (we don't have raw HTML)."""
+    `affordances` is empty on the Jina path (we don't have raw HTML).
+    `sections` is the structural outline (also empty on Jina path).
+    `llm_sections` is populated lazily by the daemon on demand."""
 
     content: str
     fetched_at: int
     final_url: str
     engine: str  # "trafilatura" | "jina"
     affordances: list[dict[str, Any]] = field(default_factory=list)
+    sections: list[Section] = field(default_factory=list)
+    llm_sections: list[Section] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +174,7 @@ async def _try_local(
         final_url=str(response.url),
         engine="trafilatura",
         affordances=parse_affordances(body, str(response.url)),
+        sections=structural_sections(body),
     )
 
 
