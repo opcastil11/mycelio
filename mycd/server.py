@@ -28,6 +28,7 @@ import httpx
 from anyio.abc import SocketStream
 from anyio.streams.tls import TLSListener
 
+from mycd.netguard import safe_fetch_client
 from mycd.extractor import (
     DEFAULT_MAX_BYTES,
     ExtractedContent,
@@ -91,6 +92,7 @@ class MycdServer:
         respect_robots: bool = True,
         fetch_ttl_seconds: int = DEFAULT_FETCH_TTL_SECONDS,
         jina_fallback: bool = True,
+        fetch_client: httpx.AsyncClient | None = None,
     ) -> None:
         self.root_seed = root_seed
         self.services = services or []
@@ -110,6 +112,18 @@ class MycdServer:
         self._http_client = http_client or httpx.AsyncClient(timeout=30)
         # Track whether we own the httpx client (so we close it on shutdown).
         self._owns_http_client = http_client is None
+        # FETCH takes URLs from anonymous callers, so in production it gets
+        # its own SSRF-guarded client (mycd.netguard). Tests that inject a
+        # mock http_client keep using it for FETCH too.
+        if fetch_client is not None:
+            self._fetch_client = fetch_client
+            self._owns_fetch_client = False
+        elif http_client is not None:
+            self._fetch_client = http_client
+            self._owns_fetch_client = False
+        else:
+            self._fetch_client = safe_fetch_client()
+            self._owns_fetch_client = True
         # FETCH state — shared in-memory cache + robots cache across calls.
         self._respect_robots = respect_robots
         self._fetch_ttl_seconds = fetch_ttl_seconds
@@ -120,6 +134,8 @@ class MycdServer:
     async def aclose(self) -> None:
         if self._owns_http_client:
             await self._http_client.aclose()
+        if self._owns_fetch_client:
+            await self._fetch_client.aclose()
 
     async def serve(self, host: str, port: int) -> None:
         """Run forever, accepting connections on (host, port).
@@ -163,6 +179,10 @@ class MycdServer:
                         return
         except (anyio.EndOfStream, anyio.BrokenResourceError):
             pass  # client disconnected, normal
+        except Exception:
+            # An unhandled error here propagates into the listener's task
+            # group and stops the whole daemon (seen in prod: malformed URLs).
+            log.exception("connection handler error")
         finally:
             await stream.aclose()
 
@@ -448,7 +468,7 @@ class MycdServer:
                 try:
                     extracted = await fetch_and_extract(
                         url,
-                        http_client=self._http_client,
+                        http_client=self._fetch_client,
                         max_bytes=max_bytes,
                         respect_robots=self._respect_robots,
                         robots_cache=self._robots_cache,
@@ -456,6 +476,10 @@ class MycdServer:
                     )
                 except ExtractorError as exc:
                     await self._send_error(stream, frame, code=exc.code, msg=exc.message)
+                    return
+                except Exception as exc:  # never let one bad URL kill the daemon
+                    log.warning("fetch %s failed: %r", url, exc)
+                    await self._send_error(stream, frame, code="fetch_failed", msg="fetch failed")
                     return
                 expires_at = now + self._fetch_ttl_seconds
                 if len(self._fetch_cache) >= FETCH_CACHE_MAX:

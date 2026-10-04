@@ -23,9 +23,12 @@ import httpx
 import trafilatura
 
 from mycd.affordances import parse_affordances
+from mycd.netguard import BlockedTarget, check_url
 from mycd.outline import Section, structural_sections
 
 DEFAULT_MAX_BYTES = 256 * 1024
+HARD_MAX_BYTES = 2 * 1024 * 1024  # ceiling for a caller-supplied max_bytes
+ROBOTS_MAX_BYTES = 512 * 1024
 DEFAULT_USER_AGENT = "MycelioFetch/0 (+https://mycelio.prowl.world)"
 ROBOTS_TIMEOUT = 5.0
 FETCH_TIMEOUT = 15.0
@@ -89,16 +92,32 @@ class TooLargeError(ExtractorError):
 
 
 def _validate_url(url: str) -> tuple[str, str]:
-    """Return (scheme, host) or raise BadURLError."""
+    """Return (scheme, netloc) or raise BadURLError.
+
+    Static SSRF checks (scheme, port allow-list, internal names, private IP
+    literals) run here; DNS-level checks run per request in the transport
+    (see ``mycd.netguard``). A malformed port used to raise a bare
+    ValueError deep inside httpx and take the whole daemon down.
+    """
     try:
-        parsed = urlparse(url)
-    except ValueError as exc:
-        raise BadURLError(f"unparseable url: {exc}") from exc
-    if parsed.scheme not in ("http", "https"):
-        raise BadURLError(f"url scheme must be http(s), got {parsed.scheme!r}")
-    if not parsed.netloc:
-        raise BadURLError("url has no host")
+        check_url(url)
+    except BlockedTarget as exc:
+        raise BadURLError(str(exc)) from exc
+    parsed = urlparse(url)
     return parsed.scheme, parsed.netloc
+
+
+async def _read_capped(response: httpx.Response, cap: int) -> bytes:
+    """Read a streamed body, aborting as soon as it exceeds ``cap`` bytes."""
+    declared = response.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > cap:
+        raise TooLargeError(f"response {declared} bytes exceeds cap {cap}")
+    buf = bytearray()
+    async for chunk in response.aiter_bytes():
+        buf.extend(chunk)
+        if len(buf) > cap:
+            raise TooLargeError(f"response exceeds cap {cap} bytes")
+    return bytes(buf)
 
 
 async def _check_robots(
@@ -114,12 +133,18 @@ async def _check_robots(
     if rp is None:
         rp = RobotFileParser()
         try:
-            r = await http_client.get(f"{cache_key}/robots.txt", timeout=ROBOTS_TIMEOUT)
-            if r.status_code == 200:
-                rp.parse(r.text.splitlines())
-            else:
-                rp.parse([])  # no robots.txt → fully allowed
-        except httpx.HTTPError:
+            async with http_client.stream(
+                "GET",
+                f"{cache_key}/robots.txt",
+                follow_redirects=True,
+                timeout=ROBOTS_TIMEOUT,
+            ) as r:
+                if r.status_code == 200:
+                    raw = await _read_capped(r, ROBOTS_MAX_BYTES)
+                    rp.parse(raw.decode("utf-8", "replace").splitlines())
+                else:
+                    rp.parse([])  # no robots.txt → fully allowed
+        except (httpx.HTTPError, TooLargeError):
             rp.parse([])  # be permissive on robots fetch errors
         if robots_cache is not None:
             robots_cache[cache_key] = rp
@@ -141,18 +166,16 @@ async def _try_local(
 ) -> ExtractedContent | None:
     """Local path: httpx fetch + trafilatura. Returns None on empty
     extraction (caller may fall back to Jina). Raises on hard failures."""
-    response = await http_client.get(
+    async with http_client.stream(
+        "GET",
         url,
         headers={"User-Agent": user_agent},
         follow_redirects=True,
         timeout=FETCH_TIMEOUT,
-    )
-    if response.status_code >= 400:
-        raise FetchFailedError(f"HTTP {response.status_code} for {url}")
-
-    body = response.content
-    if len(body) > max_bytes:
-        raise TooLargeError(f"response {len(body)} bytes exceeds cap {max_bytes}")
+    ) as response:
+        if response.status_code >= 400:
+            raise FetchFailedError(f"HTTP {response.status_code} for {url}")
+        body = await _read_capped(response, max_bytes)
 
     content_type = response.headers.get("content-type", "").lower()
     is_htmlish = (not content_type) or "html" in content_type or "xml" in content_type
@@ -236,7 +259,35 @@ async def fetch_and_extract(
     RobotFileParser per host).
     """
     _validate_url(url)
+    max_bytes = min(max_bytes, HARD_MAX_BYTES)
+    try:
+        return await _fetch_and_extract(
+            url,
+            http_client=http_client,
+            max_bytes=max_bytes,
+            respect_robots=respect_robots,
+            robots_cache=robots_cache,
+            user_agent=user_agent,
+            jina_fallback=jina_fallback,
+            jina_base=jina_base,
+        )
+    except BlockedTarget as exc:
+        # SSRF guard tripped (DNS → private IP, redirect into the internal
+        # network, bad port on a hop). Hard failure: no Jina fallback.
+        raise BadURLError(str(exc)) from exc
 
+
+async def _fetch_and_extract(
+    url: str,
+    *,
+    http_client: httpx.AsyncClient,
+    max_bytes: int,
+    respect_robots: bool,
+    robots_cache: dict[str, RobotFileParser] | None,
+    user_agent: str,
+    jina_fallback: bool,
+    jina_base: str,
+) -> ExtractedContent:
     if respect_robots:
         await _check_robots(
             url,

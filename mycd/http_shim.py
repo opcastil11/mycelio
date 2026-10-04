@@ -16,13 +16,24 @@ Config via env:
   MYCD_PORT          (default ``4242``)
   MYCD_ROOT_PUBKEY   hex-encoded 32-byte Ed25519 pubkey (required)
   MYCD_SHIM_PORT     (default ``8080``)
+  MYCD_RL_PER_MIN    per-client-IP requests/minute on /r (default 20)
+  MYCD_RL_LLM_PER_HOUR  per-IP ``mode=llm`` requests/hour (default 10)
+  MYCD_RL_GLOBAL_PER_MIN  all clients together on /r (default 600)
+  MYCD_TRUSTED_PROXIES  CIDRs whose X-Forwarded-For is trusted
+                     (default: loopback + RFC1918, i.e. Caddy on the docker net)
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
+import math
 import os
+import time
+from collections import deque
 from contextlib import asynccontextmanager
+
+from mycd.netguard import BlockedTarget, check_url
 
 from mycelio import ClientError, MycelioClient
 
@@ -44,6 +55,117 @@ _ERROR_STATUS = {
     "llm_unavailable": 501,
     "llm_failed": 502,
 }
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting (in-memory; the shim runs as a single process)
+# ---------------------------------------------------------------------------
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+
+
+def _trusted_proxies() -> list:
+    raw = os.environ.get(
+        "MYCD_TRUSTED_PROXIES",
+        "127.0.0.0/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16",
+    )
+    return [ipaddress.ip_network(c.strip(), strict=False) for c in raw.split(",") if c.strip()]
+
+
+TRUSTED_PROXIES = _trusted_proxies()
+
+
+def _is_trusted(addr: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    return any(ip in net for net in TRUSTED_PROXIES)
+
+
+def client_ip(request: Request) -> str:
+    """Real client IP. X-Forwarded-For is honoured only when the TCP peer is a
+    trusted proxy (Caddy on the docker network), and is walked right-to-left
+    so a client-supplied left-hand value cannot pick its own bucket."""
+    peer = request.client.host if request.client else "unknown"
+    if not _is_trusted(peer):
+        return peer
+    xff = request.headers.get("x-forwarded-for", "")
+    hops = [h.strip() for h in xff.split(",") if h.strip()]
+    for hop in reversed(hops):
+        if not _is_trusted(hop):
+            try:
+                return str(ipaddress.ip_address(hop))
+            except ValueError:
+                return peer
+    return hops[0] if hops else peer
+
+
+class SlidingWindow:
+    """Per-key sliding-window counter. ``hit`` returns 0 when allowed, or the
+    seconds to wait (for Retry-After) when the key is over its limit."""
+
+    MAX_KEYS = 50_000
+
+    def __init__(self, limit: int, window: float) -> None:
+        self.limit = limit
+        self.window = window
+        self._hits: dict[str, deque] = {}
+        self._last_sweep = 0.0
+
+    def hit(self, key: str, now: float | None = None) -> int:
+        now = time.monotonic() if now is None else now
+        self._sweep(now)
+        q = self._hits.setdefault(key, deque())
+        while q and q[0] <= now - self.window:
+            q.popleft()
+        if len(q) >= self.limit:
+            return max(1, math.ceil(q[0] + self.window - now))
+        q.append(now)
+        return 0
+
+    def _sweep(self, now: float) -> None:
+        if now - self._last_sweep < self.window and len(self._hits) < self.MAX_KEYS:
+            return
+        self._last_sweep = now
+        cutoff = now - self.window
+        for k in [k for k, q in self._hits.items() if not q or q[-1] <= cutoff]:
+            del self._hits[k]
+        if len(self._hits) >= self.MAX_KEYS:  # pathological: drop everything
+            self._hits.clear()
+
+
+PER_IP = SlidingWindow(_env_int("MYCD_RL_PER_MIN", 20), 60)
+LLM_PER_IP = SlidingWindow(_env_int("MYCD_RL_LLM_PER_HOUR", 10), 3600)
+GLOBAL = SlidingWindow(_env_int("MYCD_RL_GLOBAL_PER_MIN", 600), 60)
+
+
+def _rate_limited(request: Request, *, llm: bool) -> Response | None:
+    ip = client_ip(request)
+    wait = PER_IP.hit(ip)
+    scope = "per-ip"
+    if not wait and llm:
+        wait, scope = LLM_PER_IP.hit(ip), "llm per-ip"
+    if not wait:
+        wait, scope = GLOBAL.hit("*"), "global"
+    if not wait:
+        return None
+    log.info("rate limited %s (%s, retry in %ss)", ip, scope, wait)
+    body = {"error": "rate_limited", "message": f"too many requests ({scope}); retry in {wait}s"}
+    headers = {"Retry-After": str(wait)}
+    if _wants_json(request):
+        return JSONResponse(body, status_code=429, headers=headers)
+    return PlainTextResponse(
+        f"[rate_limited] {body['message']}\n",
+        status_code=429,
+        headers=headers,
+        media_type="text/plain; charset=utf-8",
+    )
 
 
 def _config() -> tuple[str, int, bytes]:
@@ -104,6 +226,10 @@ async def _do_fetch(
             "bad_url", "url must start with http:// or https://", want_json=want_json
         )
     try:
+        check_url(url)  # cheap static SSRF checks; DNS checks run in mycd
+    except BlockedTarget as exc:
+        return _error_response("bad_url", str(exc), want_json=want_json)
+    try:
         async with _client() as cli:
             page = await cli.fetch(
                 url,
@@ -114,9 +240,9 @@ async def _do_fetch(
     except ClientError as exc:
         code, msg = _parse_error(exc)
         return _error_response(code, msg, want_json=want_json)
-    except Exception as exc:  # connection refused, signature error, etc.
+    except Exception:  # connection refused, signature error, etc.
         log.exception("shim fetch failed for %s", url)
-        return _error_response("fetch_failed", str(exc), want_json=want_json)
+        return _error_response("fetch_failed", "upstream fetch failed", want_json=want_json)
 
     likely_spa, spa_reason = _detect_spa(page)
 
@@ -246,6 +372,9 @@ async def reader_prepend(request: Request) -> Response:
     """``GET /r/https://example.com`` — Jina-style prepend."""
     url = request.path_params["url"]
     outline_only, section_id, mode, attribution = _opts(request)
+    limited = _rate_limited(request, llm=(mode == "llm"))
+    if limited is not None:
+        return limited
     return await _do_fetch(
         url,
         want_json=_wants_json(request),
@@ -260,6 +389,9 @@ async def reader_query(request: Request) -> Response:
     """``GET /r?url=...`` — query-param form, easier to share."""
     url = request.query_params.get("url", "")
     outline_only, section_id, mode, attribution = _opts(request)
+    limited = _rate_limited(request, llm=(mode == "llm"))
+    if limited is not None:
+        return limited
     return await _do_fetch(
         url,
         want_json=_wants_json(request),
@@ -293,7 +425,8 @@ def main() -> None:
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
     port = int(os.environ.get("MYCD_SHIM_PORT", "8080"))
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+    # proxy_headers off: client_ip() decides when X-Forwarded-For is trusted.
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info", proxy_headers=False)
 
 
 if __name__ == "__main__":
