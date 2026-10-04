@@ -54,6 +54,7 @@ _ERROR_STATUS = {
     "section_not_found": 404,
     "llm_unavailable": 501,
     "llm_failed": 502,
+    "rate_limited": 429,
 }
 
 

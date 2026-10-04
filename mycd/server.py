@@ -28,6 +28,9 @@ import httpx
 from anyio.abc import SocketStream
 from anyio.streams.tls import TLSListener
 
+from contextvars import ContextVar
+
+from mycd.abuse import AbuseGuard, AbuseLimits
 from mycd.netguard import safe_fetch_client
 from mycd.extractor import (
     DEFAULT_MAX_BYTES,
@@ -58,6 +61,9 @@ FETCH_CACHE_MAX = 1024
 DEFAULT_FETCH_TTL_SECONDS = 24 * 3600  # 24 h
 
 log = logging.getLogger("mycd.server")
+
+# Client address of the connection the current task is serving.
+_current_peer: ContextVar[str] = ContextVar("mycd_peer", default="unknown")
 
 
 @dataclass
@@ -93,6 +99,7 @@ class MycdServer:
         fetch_ttl_seconds: int = DEFAULT_FETCH_TTL_SECONDS,
         jina_fallback: bool = True,
         fetch_client: httpx.AsyncClient | None = None,
+        abuse: AbuseGuard | None = None,
     ) -> None:
         self.root_seed = root_seed
         self.services = services or []
@@ -129,6 +136,7 @@ class MycdServer:
         self._fetch_ttl_seconds = fetch_ttl_seconds
         self._jina_fallback = jina_fallback
         self._fetch_cache: dict[str, tuple[ExtractedContent, int]] = {}
+        self.abuse = abuse or AbuseGuard(AbuseLimits.from_env())
         self._robots_cache: dict[str, Any] = {}
 
     async def aclose(self) -> None:
@@ -157,11 +165,41 @@ class MycdServer:
     # ------------------------------------------------------------------
 
     async def _handle_connection(self, stream: SocketStream) -> None:
+        peer = _peer_ip(stream)
+        reason = self.abuse.open(peer)
+        if reason is not None:
+            log.info("reject connection from %s: %s", peer, reason)
+            await self._send_goodbye(stream, reason=reason, code=2)
+            await stream.aclose()
+            return
+        _current_peer.set(peer)
+        limits = self.abuse.limits
+        started = time.monotonic()
         try:
             buf = bytearray()
-            async for chunk in stream:
+            while True:
+                remaining = limits.session_max - (time.monotonic() - started)
+                if remaining <= 0:
+                    await self._send_goodbye(stream, reason="session time limit reached", code=2)
+                    return
+                try:
+                    with anyio.fail_after(min(limits.idle_timeout, remaining)):
+                        chunk = await stream.receive()
+                except TimeoutError:
+                    await self._send_goodbye(stream, reason="idle timeout", code=2)
+                    return
                 buf.extend(chunk)
                 while len(buf) >= HEADER_LEN:
+                    # Size check from the header, before buffering the body.
+                    declared = int.from_bytes(buf[10:14], "big")
+                    if declared > limits.max_frame:
+                        log.info("frame too large from %s: %d bytes", peer, declared)
+                        await self._send_goodbye(
+                            stream,
+                            reason=f"frame payload {declared} exceeds limit {limits.max_frame}",
+                            code=2,
+                        )
+                        return
                     try:
                         frame, consumed = decode_frame(bytes(buf))
                     except FrameError as exc:
@@ -174,16 +212,21 @@ class MycdServer:
                         return
                     del buf[:consumed]
 
+                    if not self.abuse.allow_frame(peer):
+                        log.info("frame rate exceeded by %s", peer)
+                        await self._send_goodbye(stream, reason="frame rate limit exceeded", code=2)
+                        return
                     closed = await self._dispatch(stream, frame)
                     if closed:
                         return
-        except (anyio.EndOfStream, anyio.BrokenResourceError):
+        except (anyio.EndOfStream, anyio.BrokenResourceError, anyio.ClosedResourceError):
             pass  # client disconnected, normal
         except Exception:
             # An unhandled error here propagates into the listener's task
             # group and stops the whole daemon (seen in prod: malformed URLs).
             log.exception("connection handler error")
         finally:
+            self.abuse.close(peer)
             await stream.aclose()
 
     # ------------------------------------------------------------------
@@ -429,6 +472,14 @@ class MycdServer:
             await self._send_error(stream, frame, code="bad_url", msg="field 1 (url) required")
             return
 
+        wait = self.abuse.allow_fetch(_current_peer.get())
+        if wait:
+            await self._send_error(
+                stream, frame, code="rate_limited",
+                msg=f"FETCH rate limit ({self.abuse.limits.fetch_per_min}/min per address); retry in {wait}s",
+            )
+            return
+
         mb_field = req.get(2)
         max_bytes = mb_field[1] if mb_field and mb_field[1] > 0 else DEFAULT_MAX_BYTES
         outline_only = bool(req.get(7, (None, False))[1])
@@ -620,6 +671,16 @@ class MycdServer:
             await stream.send(encode_frame(bye))
         except (anyio.BrokenResourceError, anyio.ClosedResourceError):
             pass
+
+
+def _peer_ip(stream: SocketStream) -> str:
+    try:
+        from anyio.abc import SocketAttribute
+
+        addr = stream.extra(SocketAttribute.remote_address)
+        return str(addr[0] if isinstance(addr, tuple) else addr)
+    except Exception:
+        return "unknown"
 
 
 def _build_manifest_extracted(manifest: Manifest, url: str, now: int) -> ExtractedContent:
